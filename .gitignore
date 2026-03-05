@@ -4,3 +4,13 @@ __pycache__
 
 .vscode
 .DS_Store
+
+# LOTUS Execution Logs
+*lotus_execution_log*.json
+*mem0_execution_log_*.json
+*zep_execution_log_*.json
+*evermemos_lotus_execution_log_*.json
+*mem0_ent_idx*
+*mem0_fact_idx*
+*mem0_rel_idx*
+*mem0_run.log*

@@ -55,7 +55,7 @@ from lotus.vector_store import FaissVS
 # ─────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────
-LOCOMO_PATH = Path("evermemos/evaluation/data/locomo/locomo10.json")
+LOCOMO_PATH = Path("../evermemos/evaluation/data/locomo/locomo10.json")
 CONV_INDEX = 0                  # which conversation to process
 MAX_MESSAGES = 40               # truncate to first N messages for testing
 BOUNDARY_MSG_THRESHOLD = 15     # force boundary if >= N messages accumulated
