@@ -1,0 +1,12 @@
+[submodule "lotus"]
+	path = lotus
+	url = https://github.com/SleepyLGod/lotus.git
+[submodule "EverMemOS"]
+	path = EverMemOS
+	url = https://github.com/SleepyLGod/EverMemOS.git
+[submodule "mem0"]
+	path = mem0
+	url = https://github.com/SleepyLGod/mem0.git
+[submodule "zep-graphiti"]
+	path = zep-graphiti
+	url = https://github.com/SleepyLGod/zep-graphiti.git
