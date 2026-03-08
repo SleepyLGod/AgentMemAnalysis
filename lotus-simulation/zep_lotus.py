@@ -117,6 +117,47 @@ ent_counter = 0
 edge_counter = 0
 comm_counter = 0
 
+
+def infer_dominant_neighbor_community(
+    entity_name: str,
+    active_edges: pd.DataFrame,
+    entity_name_to_uuid: dict[str, str],
+    membership: dict[str, str],
+) -> str | None:
+    """
+    Mimic Graphiti insertion behavior: if the entity itself has no community,
+    infer from neighboring entities' existing communities (mode).
+    """
+    community_counts: dict[str, int] = {}
+
+    for _, edge in active_edges.iterrows():
+        src_name = str(edge.get("src_name", ""))
+        tgt_name = str(edge.get("tgt_name", ""))
+
+        neighbor_name = None
+        if src_name == entity_name:
+            neighbor_name = tgt_name
+        elif tgt_name == entity_name:
+            neighbor_name = src_name
+
+        if not neighbor_name:
+            continue
+
+        neighbor_uuid = entity_name_to_uuid.get(neighbor_name)
+        if not neighbor_uuid:
+            continue
+
+        neighbor_comm = membership.get(neighbor_uuid)
+        if not neighbor_comm:
+            continue
+
+        community_counts[neighbor_comm] = community_counts.get(neighbor_comm, 0) + 1
+
+    if not community_counts:
+        return None
+
+    return max(community_counts.items(), key=lambda kv: kv[1])[0]
+
 print("\n" + "=" * 60)
 print("Starting Zep Pipeline")
 print("=" * 60)
@@ -264,15 +305,23 @@ for msg_idx in range(len(messages)):
         is_dup, is_contra = False, False
         
         # [Q5] Duplicate Detection
-        # Strict topology constraint typically applied in DB before sem_join, but we simulate full semantic
+        # Strict topology pre-filter: only compare edges with identical src/tgt endpoints.
+        topology_hist_edges = active_hist_edges[
+            (active_hist_edges["src_name"] == s_name) & (active_hist_edges["tgt_name"] == t_name)
+        ]
         dup_prompt = "Fact '{fact:left}' represents absolutely identical factual information as Fact '{fact:right}'"
         try:
-            dup_matches = cur_edge_df.sem_join(active_hist_edges, dup_prompt)
+            if len(topology_hist_edges) > 0:
+                dup_matches = cur_edge_df.sem_join(topology_hist_edges, dup_prompt)
+            else:
+                dup_matches = pd.DataFrame()
+            log_operation("Q5_sem_join", dup_prompt, cur_edge_df, dup_matches)
             if len(dup_matches) > 0:
                 is_dup = True
                 print("      [Q5] DUP DETECTED.")
         except Exception as e:
             print(f"      Q5 Error: {e}")
+            log_operation("Q5_sem_join", dup_prompt, cur_edge_df, error=e)
 
         # [Q6] Contradiction Detection
         if not is_dup:
@@ -280,6 +329,7 @@ for msg_idx in range(len(messages)):
             try:
                 # Assuming loose topology, cross-check against all active
                 contra_matches = cur_edge_df.sem_join(active_hist_edges, contra_prompt)
+                log_operation("Q6_sem_join", contra_prompt, cur_edge_df, contra_matches)
                 if len(contra_matches) > 0:
                     is_contra = True
                     print(f"      [Q6] CONTRADICTION DETECTED. Invalidating {len(contra_matches)} old facts.")
@@ -288,6 +338,7 @@ for msg_idx in range(len(messages)):
                         history_edges_df.loc[history_edges_df["uuid"] == uuid_to_inv, "invalidated"] = True
             except Exception as e:
                 print(f"      Q6 Error: {e}")
+                log_operation("Q6_sem_join", contra_prompt, cur_edge_df, error=e)
 
         # Insert if not dup
         if not is_dup:
@@ -300,7 +351,12 @@ for msg_idx in range(len(messages)):
     # ══════════════════════════════════════════════════════════
     # PHASE 3: COMMUNITY UPDATE (SIMULATING ZEP'S N->1 RACE LOOP)
     # ══════════════════════════════════════════════════════════
-    # Zep updates communities by iterating per-entity, synthesizing the community summary pairwise (no grouping)
+    # Zep insertion only updates EXISTING communities. It does not create/rebuild communities here.
+    # If no communities were built beforehand, this phase effectively does nothing.
+    active_edges_for_community = history_edges_df[history_edges_df["invalidated"] == False]
+    entity_name_to_uuid = {
+        str(row["name"]): str(row["uuid"]) for _, row in history_entities_df.iterrows()
+    }
     
     for ent in resolved_entities:
         e_uuid = ent["uuid"]
@@ -310,42 +366,52 @@ for msg_idx in range(len(messages)):
         c_uuid = community_membership.get(e_uuid)
         
         if c_uuid is None:
-            # Create a new mini-community for this entity
-            print(f"  [Q7] Creating new Community for Node {e_name}...")
-            c_uuid = f"comm_{comm_counter}"
-            comm_counter += 1
-            community_membership[e_uuid] = c_uuid
-            # Simulate Q8 Naming later
-            history_communities_df.loc[len(history_communities_df)] = [c_uuid, "TBD", e_summ]
-            
-        else:
-            # Update existing community using the flawed Zep pairwise sem_map
-            print(f"  [Q7/Q8] Updating Community for Node {e_name} (Zep N-to-1 Flaw Simulation)...")
-            c_row = history_communities_df[history_communities_df["uuid"] == c_uuid].iloc[0]
-            c_hist_summ = c_row["summary"]
-            
-            # Simulated zep pairwise merge (sem_map instead of proper sem_agg group-by)
-            comm_df = pd.DataFrame({"e_sum": [e_summ], "c_sum": [c_hist_summ]})
-            fuse_prompt = "Entity info: {e_sum}\nCommunity info: {c_sum}\nSynthesize these two into a single succinct community summary."
-            
-            try:
-                fuse_res = comm_df.sem_map(fuse_prompt)
-                log_operation("Q7_sem_map_community", fuse_prompt, comm_df, fuse_res)
-                fused_summary = str(fuse_res["_map"].iloc[0])
-                
-                # Q8 Name generation
-                name_df = pd.DataFrame({"fuse": [fused_summary]})
-                name_prompt = "Create a short one-sentence title (5 words max) summarizing: {fuse}"
-                name_res = name_df.sem_map(name_prompt)
-                log_operation("Q8_sem_map_naming", name_prompt, name_df, name_res)
-                
-                new_name = str(name_res["_map"].iloc[0])
-                
-                history_communities_df.loc[history_communities_df["uuid"] == c_uuid, "summary"] = fused_summary
-                history_communities_df.loc[history_communities_df["uuid"] == c_uuid, "name"] = new_name
-            except Exception as e:
-                print(f"    Error in Community Update: {e}")
-                log_operation("Q7_Q8_sem_map", fuse_prompt, comm_df, error=e)
+            # Try to infer from neighboring entities' existing communities (mode).
+            inferred_c_uuid = infer_dominant_neighbor_community(
+                e_name,
+                active_edges_for_community,
+                entity_name_to_uuid,
+                community_membership,
+            )
+            if inferred_c_uuid is not None:
+                c_uuid = inferred_c_uuid
+                community_membership[e_uuid] = c_uuid
+                print(f"  [Q7] Node {e_name} assigned to existing community {c_uuid} via neighbors.")
+
+        if c_uuid is None:
+            print(f"  [Q7] Node {e_name} has no existing community context. Skipping update.")
+            continue
+
+        c_rows = history_communities_df[history_communities_df["uuid"] == c_uuid]
+        if len(c_rows) == 0:
+            print(f"  [Q7] Community {c_uuid} missing in DB snapshot. Skipping update.")
+            continue
+
+        # Update existing community via pairwise summary fusion (known N->1 write limitation).
+        print(f"  [Q7/Q8] Updating existing Community for Node {e_name}...")
+        c_hist_summ = c_rows.iloc[0]["summary"]
+
+        comm_df = pd.DataFrame({"e_sum": [e_summ], "c_sum": [c_hist_summ]})
+        fuse_prompt = "Entity info: {e_sum}\nCommunity info: {c_sum}\nSynthesize these two into a single succinct community summary."
+
+        try:
+            fuse_res = comm_df.sem_map(fuse_prompt)
+            log_operation("Q7_sem_map_community", fuse_prompt, comm_df, fuse_res)
+            fused_summary = str(fuse_res["_map"].iloc[0])
+
+            # Q8 Name generation
+            name_df = pd.DataFrame({"fuse": [fused_summary]})
+            name_prompt = "Create a short one-sentence title (5 words max) summarizing: {fuse}"
+            name_res = name_df.sem_map(name_prompt)
+            log_operation("Q8_sem_map_naming", name_prompt, name_df, name_res)
+
+            new_name = str(name_res["_map"].iloc[0])
+
+            history_communities_df.loc[history_communities_df["uuid"] == c_uuid, "summary"] = fused_summary
+            history_communities_df.loc[history_communities_df["uuid"] == c_uuid, "name"] = new_name
+        except Exception as e:
+            print(f"    Error in Community Update: {e}")
+            log_operation("Q7_Q8_sem_map", fuse_prompt, comm_df, error=e)
 
 
 # Finalize

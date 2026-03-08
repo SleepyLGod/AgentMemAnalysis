@@ -60,6 +60,7 @@ CONV_INDEX = 0                  # which conversation to process
 MAX_MESSAGES = 40               # truncate to first N messages for testing
 BOUNDARY_MSG_THRESHOLD = 15     # force boundary if >= N messages accumulated
 TOPIC_SIM_THRESHOLD = 0.5       # cosine similarity threshold for topic matching
+TOPIC_MAX_GAP_DAYS = 7          # only applied when both timestamps are parseable
 PROFILE_MIN_SEGMENTS = 2        # min segments in a topic before profile distillation
 
 timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -167,6 +168,29 @@ def format_messages(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def parse_session_time(session_time: str | None) -> datetime | None:
+    """
+    Parse LOCOMO session time strings like "1:56 pm on 8 May, 2023".
+    Returns None if parsing fails so downstream can safely skip time-gap checks.
+    """
+    if not session_time or not isinstance(session_time, str):
+        return None
+
+    normalized = session_time.strip()
+    normalized = normalized.replace(" am on ", " AM on ").replace(" pm on ", " PM on ")
+
+    fmts = [
+        "%I:%M %p on %d %B, %Y",
+        "%I:%M %p on %d %b, %Y",
+    ]
+    for fmt in fmts:
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 # ─────────────────────────────────────────────────────
 # State
 # ─────────────────────────────────────────────────────
@@ -224,6 +248,7 @@ for msg_idx, msg in enumerate(all_messages):
     segment_counter += 1
     window_content = format_messages(tumbling_window)
     n_msgs = len(tumbling_window)
+    segment_timestamp = parse_session_time(tumbling_window[-1].get("session_time"))
 
     print(f"\n{'─' * 50}")
     print(f"  SEALED SEGMENT {segment_id} ({n_msgs} messages)")
@@ -307,26 +332,44 @@ for msg_idx, msg in enumerate(all_messages):
     episode_embedding = rm([episode_text])[0]
     assigned_topic = None
     best_sim = -1.0
+    best_gap_days = None
 
     for tid, topic_info in topics.items():
         centroid = topic_info["centroid"]
         sim = float(np.dot(episode_embedding, centroid) /
                      (np.linalg.norm(episode_embedding) * np.linalg.norm(centroid) + 1e-9))
+
+        topic_timestamp = topic_info.get("last_timestamp")
+        gap_days = None
+        time_gap_ok = True
+        if segment_timestamp is not None and topic_timestamp is not None:
+            gap_days = abs((segment_timestamp - topic_timestamp).total_seconds()) / 86400.0
+            time_gap_ok = gap_days <= TOPIC_MAX_GAP_DAYS
+
         if sim > best_sim:
             best_sim = sim
-            if sim >= TOPIC_SIM_THRESHOLD:
+            best_gap_days = gap_days
+            if sim >= TOPIC_SIM_THRESHOLD and time_gap_ok:
                 assigned_topic = tid
 
+    gap_text = "N/A" if best_gap_days is None else f"{best_gap_days:.2f}d"
     if assigned_topic is None:
         assigned_topic = f"topic_{topic_counter}"
         topic_counter += 1
-        topics[assigned_topic] = {"centroid": episode_embedding, "segments": [], "segment_count": 0}
-        print(f"  NEW topic: {assigned_topic} (sim={best_sim:.3f})")
+        topics[assigned_topic] = {
+            "centroid": episode_embedding,
+            "segments": [],
+            "segment_count": 0,
+            "last_timestamp": segment_timestamp,
+        }
+        print(f"  NEW topic: {assigned_topic} (sim={best_sim:.3f}, gap={gap_text})")
     else:
         old_centroid = topics[assigned_topic]["centroid"]
         n = topics[assigned_topic]["segment_count"]
         topics[assigned_topic]["centroid"] = (old_centroid * n + episode_embedding) / (n + 1)
-        print(f"  MERGED into {assigned_topic} (sim={best_sim:.3f})")
+        if segment_timestamp is not None:
+            topics[assigned_topic]["last_timestamp"] = segment_timestamp
+        print(f"  MERGED into {assigned_topic} (sim={best_sim:.3f}, gap={gap_text})")
 
     topics[assigned_topic]["segments"].append(segment_id)
     topics[assigned_topic]["segment_count"] += 1
@@ -339,6 +382,7 @@ for msg_idx, msg in enumerate(all_messages):
         "foresights": foresights,
         "facts": facts,
         "topic_id": assigned_topic,
+        "segment_time": segment_timestamp.isoformat() if segment_timestamp else None,
     })
 
     # Q7: Profile Distillation
