@@ -30,16 +30,18 @@ os.environ["DEEPSEEK_API_KEY"] = os.getenv("DEEPSEEK_API_KEY", "")
 import lotus
 from lotus.models import LM, SentenceTransformersRM
 from lotus.vector_store import FaissVS
+from lotus_opt_config import build_cascade_args, load_opt_config
 
 # ─────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────
 LOCOMO_PATH = Path("../evermemos/evaluation/data/locomo/locomo10.json")
 CONV_INDEX = 0                  
-MAX_MESSAGES = 15               # Limited to avoid long runs
+MAX_MESSAGES = 40               # Expanded for fuller request coverage
 
 # Proxy Optimization Thresholds (Simulates LLM offloading)
 SIM_NOOP_THRESHOLD = 0.92       # If cosine sim >= 0.92, auto-assume NOOP (Exact match)
+OPT_CONFIG = load_opt_config()
 
 timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 LOG_JSON_PATH = Path(f"mem0_execution_log_{timestamp_str}.json")
@@ -54,20 +56,73 @@ print("=" * 60)
 lm = LM(model="deepseek/deepseek-chat", max_tokens=1000, temperature=0.0, max_batch_size=2)
 rm = SentenceTransformersRM(model="intfloat/e5-base-v2")
 vs = FaissVS()
-lotus.settings.configure(lm=lm, rm=rm, vs=vs, enable_cache=True)
+helper_lm = None
+effective_proxy_model = OPT_CONFIG.proxy_model
+if OPT_CONFIG.proxy_model == "helper_lm":
+    if OPT_CONFIG.helper_model:
+        helper_lm = LM(
+            model=OPT_CONFIG.helper_model,
+            max_tokens=1000,
+            temperature=0.0,
+            max_batch_size=2,
+        )
+        print(f"[OPT] Helper LM enabled: {OPT_CONFIG.helper_model}")
+    else:
+        effective_proxy_model = "embedding"
+        print(
+            "[OPT] LOTUS_OPT_PROXY_MODEL=helper_lm but LOTUS_HELPER_MODEL is unset. "
+            "Falling back to embedding proxy."
+        )
+
+configure_kwargs = {"lm": lm, "rm": rm, "vs": vs, "enable_cache": True}
+if helper_lm is not None:
+    configure_kwargs["helper_lm"] = helper_lm
+lotus.settings.configure(**configure_kwargs)
 print("LOTUS cache enabled.")
+FILTER_CASCADE_ARGS = (
+    build_cascade_args(OPT_CONFIG, effective_proxy_model)
+    if OPT_CONFIG.filter_cascade_enabled
+    else None
+)
+JOIN_CASCADE_ARGS = (
+    build_cascade_args(OPT_CONFIG, effective_proxy_model)
+    if OPT_CONFIG.join_cascade_enabled
+    else None
+)
+print(
+    "[OPT] filter_cascade={}, join_cascade={}, topk_cascade={} (top-k unused in mem0 script)".format(
+        OPT_CONFIG.filter_cascade_enabled,
+        OPT_CONFIG.join_cascade_enabled,
+        OPT_CONFIG.topk_cascade_enabled,
+    )
+)
 
 # ─────────────────────────────────────────────────────
 # Logging utility
 # ─────────────────────────────────────────────────────
 exec_log = {
     "start_time": datetime.now().isoformat(),
-    "config": {"max_messages": MAX_MESSAGES},
+    "config": {
+        "max_messages": MAX_MESSAGES,
+        "optimizations": {
+            "filter_cascade_enabled": OPT_CONFIG.filter_cascade_enabled,
+            "join_cascade_enabled": OPT_CONFIG.join_cascade_enabled,
+            "topk_cascade_enabled": OPT_CONFIG.topk_cascade_enabled,
+            "proxy_model_requested": OPT_CONFIG.proxy_model,
+            "proxy_model_effective": effective_proxy_model,
+            "recall_target": OPT_CONFIG.recall_target,
+            "precision_target": OPT_CONFIG.precision_target,
+            "failure_probability": OPT_CONFIG.failure_probability,
+            "sampling_percentage": OPT_CONFIG.sampling_percentage,
+            "min_join_cascade_size": OPT_CONFIG.min_join_cascade_size,
+            "helper_model": OPT_CONFIG.helper_model,
+        },
+    },
     "operations": [],
     "summary": {}
 }
 
-def log_operation(op_type, prompt, df_in, df_out=pd.DataFrame(), error=None):
+def log_operation(op_type, prompt, df_in, df_out=pd.DataFrame(), error=None, extra=None):
     record = {
         "timestamp": datetime.now().isoformat(),
         "operator": op_type,
@@ -82,6 +137,8 @@ def log_operation(op_type, prompt, df_in, df_out=pd.DataFrame(), error=None):
     else:
         record["status"] = "SUCCESS"
         record["outputs"] = df_out.to_dict(orient="records")
+    if extra:
+        record.update(extra)
     exec_log["operations"].append(record)
     with open(LOG_JSON_PATH, "w") as f:
         json.dump(exec_log, f, indent=2, ensure_ascii=False)
@@ -371,8 +428,44 @@ for msg_idx, msg in enumerate(messages):
                     
                     filter_prompt = "{cur_ent} and {hist_ent} refer to the exact same real-world entity."
                     try:
-                        aligned = filter_df.sem_filter(filter_prompt)
-                        log_operation("Q8_sem_filter", filter_prompt, filter_df, aligned)
+                        q8_cascade_args = FILTER_CASCADE_ARGS
+                        q8_stats = None
+                        filter_df_for_run = filter_df
+
+                        if q8_cascade_args is not None and effective_proxy_model == "embedding":
+                            try:
+                                filter_df_for_run = filter_df.sem_index(
+                                    "cur_ent", "mem0_q8_filter_cur_ent_idx"
+                                )
+                            except Exception as idx_err:
+                                print(
+                                    "    [OPT] Q8 cascade index setup failed "
+                                    f"({idx_err}). Falling back to standard sem_filter."
+                                )
+                                q8_cascade_args = None
+
+                        if q8_cascade_args is not None:
+                            try:
+                                aligned, q8_stats = filter_df_for_run.sem_filter(
+                                    filter_prompt,
+                                    cascade_args=q8_cascade_args,
+                                    return_stats=True,
+                                )
+                            except Exception as cascade_err:
+                                print(
+                                    "    [OPT] Q8 cascade sem_filter failed "
+                                    f"({cascade_err}). Falling back to standard sem_filter."
+                                )
+                                aligned = filter_df.sem_filter(filter_prompt)
+                                q8_cascade_args = None
+                                q8_stats = None
+                        else:
+                            aligned = filter_df_for_run.sem_filter(filter_prompt)
+
+                        extra = {"cascade_enabled": q8_cascade_args is not None}
+                        if q8_stats is not None:
+                            extra["cascade_stats"] = q8_stats
+                        log_operation("Q8_sem_filter", filter_prompt, filter_df, aligned, extra=extra)
                         
                         # Any that survived the filter are 'SAME', others are added as new entities.
                         matched_map = {}
@@ -566,6 +659,7 @@ exec_log["summary"] = {
     "virtual_cost_usd": lm.stats.virtual_usage.total_cost,
     "physical_cost_usd": lm.stats.physical_usage.total_cost,
     "cache_hits": lm.stats.cache_hits,
+    "operator_cache_hits": lm.stats.operator_cache_hits,
 }
 with open(LOG_JSON_PATH, "w") as f:
     json.dump(exec_log, f, indent=2, ensure_ascii=False)

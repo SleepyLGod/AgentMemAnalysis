@@ -30,14 +30,17 @@ os.environ["DEEPSEEK_API_KEY"] = os.getenv("DEEPSEEK_API_KEY", "")
 import lotus
 from lotus.models import LM, SentenceTransformersRM
 from lotus.vector_store import FaissVS
+from lotus_opt_config import build_cascade_args, load_opt_config
 
 # ─────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────
 LOCOMO_PATH = Path("../evermemos/evaluation/data/locomo/locomo10.json")
 CONV_INDEX = 0                  
-MAX_MESSAGES = 15               # Limited to avoid long runs
+MAX_MESSAGES = 40               # Expanded for fuller request coverage
 SLIDING_WINDOW_SIZE = 10        # Simulate Zep's Limit 10 context window retrieved per message
+AUTO_BUILD_COMMUNITIES_AFTER_MSG = 6  # Build communities once after N processed messages
+OPT_CONFIG = load_opt_config()
 
 timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 LOG_JSON_PATH = Path(f"zep_execution_log_{timestamp_str}.json")
@@ -52,20 +55,74 @@ print("=" * 60)
 lm = LM(model="deepseek/deepseek-chat", max_tokens=1000, temperature=0.0, max_batch_size=2)
 rm = SentenceTransformersRM(model="intfloat/e5-base-v2")
 vs = FaissVS()
-lotus.settings.configure(lm=lm, rm=rm, vs=vs, enable_cache=True)
+helper_lm = None
+effective_proxy_model = OPT_CONFIG.proxy_model
+if OPT_CONFIG.proxy_model == "helper_lm":
+    if OPT_CONFIG.helper_model:
+        helper_lm = LM(
+            model=OPT_CONFIG.helper_model,
+            max_tokens=1000,
+            temperature=0.0,
+            max_batch_size=2,
+        )
+        print(f"[OPT] Helper LM enabled: {OPT_CONFIG.helper_model}")
+    else:
+        effective_proxy_model = "embedding"
+        print(
+            "[OPT] LOTUS_OPT_PROXY_MODEL=helper_lm but LOTUS_HELPER_MODEL is unset. "
+            "Falling back to embedding proxy."
+        )
+
+configure_kwargs = {"lm": lm, "rm": rm, "vs": vs, "enable_cache": True}
+if helper_lm is not None:
+    configure_kwargs["helper_lm"] = helper_lm
+lotus.settings.configure(**configure_kwargs)
 print("LOTUS cache enabled.")
+FILTER_CASCADE_ARGS = (
+    build_cascade_args(OPT_CONFIG, effective_proxy_model)
+    if OPT_CONFIG.filter_cascade_enabled
+    else None
+)
+JOIN_CASCADE_ARGS = (
+    build_cascade_args(OPT_CONFIG, effective_proxy_model)
+    if OPT_CONFIG.join_cascade_enabled
+    else None
+)
+print(
+    "[OPT] filter_cascade={}, join_cascade={}, topk_cascade={} (top-k unused in zep script)".format(
+        OPT_CONFIG.filter_cascade_enabled,
+        OPT_CONFIG.join_cascade_enabled,
+        OPT_CONFIG.topk_cascade_enabled,
+    )
+)
 
 # ─────────────────────────────────────────────────────
 # Logging utility
 # ─────────────────────────────────────────────────────
 exec_log = {
     "start_time": datetime.now().isoformat(),
-    "config": {"max_messages": MAX_MESSAGES, "window": SLIDING_WINDOW_SIZE},
+    "config": {
+        "max_messages": MAX_MESSAGES,
+        "window": SLIDING_WINDOW_SIZE,
+        "optimizations": {
+            "filter_cascade_enabled": OPT_CONFIG.filter_cascade_enabled,
+            "join_cascade_enabled": OPT_CONFIG.join_cascade_enabled,
+            "topk_cascade_enabled": OPT_CONFIG.topk_cascade_enabled,
+            "proxy_model_requested": OPT_CONFIG.proxy_model,
+            "proxy_model_effective": effective_proxy_model,
+            "recall_target": OPT_CONFIG.recall_target,
+            "precision_target": OPT_CONFIG.precision_target,
+            "failure_probability": OPT_CONFIG.failure_probability,
+            "sampling_percentage": OPT_CONFIG.sampling_percentage,
+            "min_join_cascade_size": OPT_CONFIG.min_join_cascade_size,
+            "helper_model": OPT_CONFIG.helper_model,
+        },
+    },
     "operations": [],
     "summary": {}
 }
 
-def log_operation(op_type, prompt, df_in, df_out=pd.DataFrame(), error=None):
+def log_operation(op_type, prompt, df_in, df_out=pd.DataFrame(), error=None, extra=None):
     record = {
         "timestamp": datetime.now().isoformat(),
         "operator": op_type,
@@ -80,9 +137,36 @@ def log_operation(op_type, prompt, df_in, df_out=pd.DataFrame(), error=None):
     else:
         record["status"] = "SUCCESS"
         record["outputs"] = df_out.to_dict(orient="records")
+    if extra:
+        record.update(extra)
     exec_log["operations"].append(record)
     with open(LOG_JSON_PATH, "w") as f:
         json.dump(exec_log, f, indent=2, ensure_ascii=False)
+
+
+def sem_join_with_optional_cascade(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    join_prompt: str,
+) -> tuple[pd.DataFrame, dict | None, bool]:
+    if JOIN_CASCADE_ARGS is None:
+        return left_df.sem_join(right_df, join_prompt), None, False
+
+    try:
+        joined_df, join_stats = left_df.sem_join(
+            right_df,
+            join_prompt,
+            cascade_args=JOIN_CASCADE_ARGS,
+            return_stats=True,
+        )
+        return joined_df, join_stats, True
+    except Exception as cascade_err:
+        print(
+            "    [OPT] Join cascade failed "
+            f"({cascade_err}). Falling back to standard sem_join."
+        )
+        joined_df = left_df.sem_join(right_df, join_prompt)
+        return joined_df, {"cascade_fallback_error": str(cascade_err)}, False
 
 
 # ─────────────────────────────────────────────────────
@@ -158,11 +242,112 @@ def infer_dominant_neighbor_community(
 
     return max(community_counts.items(), key=lambda kv: kv[1])[0]
 
+
+def build_initial_communities_once(
+    entities_df: pd.DataFrame,
+    edges_df: pd.DataFrame,
+    communities_df: pd.DataFrame,
+    membership: dict[str, str],
+    comm_counter_start: int,
+) -> tuple[pd.DataFrame, dict[str, str], int, int]:
+    """
+    Simulate Graphiti's standalone build_communities flow:
+    build community snapshots from current graph topology so later insertion updates can work.
+    """
+    if len(entities_df) == 0:
+        return communities_df, membership, comm_counter_start, 0
+
+    active_edges = edges_df[edges_df["invalidated"] == False]
+    if len(active_edges) == 0:
+        return communities_df, membership, comm_counter_start, 0
+
+    name_to_uuid = {
+        str(row["name"]): str(row["uuid"]) for _, row in entities_df.iterrows()
+    }
+    uuid_to_summary = {
+        str(row["uuid"]): str(row.get("summary", "")) for _, row in entities_df.iterrows()
+    }
+
+    # Undirected adjacency for connected-component community seeds.
+    adj: dict[str, set[str]] = {}
+    for _, edge in active_edges.iterrows():
+        s_name = str(edge.get("src_name", ""))
+        t_name = str(edge.get("tgt_name", ""))
+        s_uuid = name_to_uuid.get(s_name)
+        t_uuid = name_to_uuid.get(t_name)
+        if not s_uuid or not t_uuid:
+            continue
+        adj.setdefault(s_uuid, set()).add(t_uuid)
+        adj.setdefault(t_uuid, set()).add(s_uuid)
+
+    visited: set[str] = set()
+    components: list[list[str]] = []
+
+    for start in adj.keys():
+        if start in visited:
+            continue
+        stack = [start]
+        visited.add(start)
+        comp: list[str] = []
+        while stack:
+            cur = stack.pop()
+            comp.append(cur)
+            for nei in adj.get(cur, set()):
+                if nei not in visited:
+                    visited.add(nei)
+                    stack.append(nei)
+        if len(comp) > 0:
+            components.append(comp)
+
+    built_count = 0
+    comm_counter = comm_counter_start
+
+    for comp in components:
+        summaries = [
+            uuid_to_summary.get(u, "") for u in comp if uuid_to_summary.get(u, "").strip()
+        ]
+        if len(summaries) == 0:
+            continue
+
+        summary_input = pd.DataFrame({"member_summaries": ["\n".join(summaries)]})
+        summary_prompt = (
+            "Given these entity summaries from one graph community:\n{member_summaries}\n"
+            "Write one concise community summary."
+        )
+        try:
+            summary_res = summary_input.sem_map(summary_prompt)
+            log_operation("Q_BUILD_sem_map_summary", summary_prompt, summary_input, summary_res)
+            community_summary = str(summary_res["_map"].iloc[0]).strip()
+        except Exception as e:
+            log_operation("Q_BUILD_sem_map_summary", summary_prompt, summary_input, error=e)
+            community_summary = summaries[0]
+
+        name_input = pd.DataFrame({"fuse": [community_summary]})
+        name_prompt = "Create a short one-sentence title (5 words max) summarizing: {fuse}"
+        try:
+            name_res = name_input.sem_map(name_prompt)
+            log_operation("Q_BUILD_sem_map_name", name_prompt, name_input, name_res)
+            community_name = str(name_res["_map"].iloc[0]).strip()
+        except Exception as e:
+            log_operation("Q_BUILD_sem_map_name", name_prompt, name_input, error=e)
+            community_name = "Community"
+
+        c_uuid = f"comm_{comm_counter}"
+        comm_counter += 1
+        communities_df.loc[len(communities_df)] = [c_uuid, community_name, community_summary]
+        for u in comp:
+            membership[u] = c_uuid
+        built_count += 1
+
+    return communities_df, membership, comm_counter, built_count
+
 print("\n" + "=" * 60)
 print("Starting Zep Pipeline")
 print("=" * 60)
 
-# Zep processes EVERY single incoming message individually, but pulls the last up-to-10 messages as context.
+# Zep processes EVERY incoming request, even before the window reaches full length.
+# It always uses the latest up-to-10 messages as context for that request.
+auto_build_done = False
 for msg_idx in range(len(messages)):
     w_start = max(0, msg_idx - SLIDING_WINDOW_SIZE + 1)
     window_msgs = messages[w_start:msg_idx+1]
@@ -211,8 +396,13 @@ for msg_idx in range(len(messages)):
         try:
             join_prompt = "{name:left} and {name:right} refer to the identical real-world object or concept."
             # Note: We do an inner join to find matches. If a recent entity has no match, it's new.
-            matches = recent_entities.sem_join(history_entities_df, join_prompt)
-            log_operation("Q2_sem_join", join_prompt, recent_entities, matches)
+            matches, q2_join_stats, q2_cascade_used = sem_join_with_optional_cascade(
+                recent_entities, history_entities_df, join_prompt
+            )
+            extra = {"cascade_enabled": q2_cascade_used}
+            if q2_join_stats is not None:
+                extra["cascade_stats"] = q2_join_stats
+            log_operation("Q2_sem_join", join_prompt, recent_entities, matches, extra=extra)
             
             matched_recent_names = matches["name_left"].tolist() if "name_left" in matches.columns else []
             
@@ -312,10 +502,16 @@ for msg_idx in range(len(messages)):
         dup_prompt = "Fact '{fact:left}' represents absolutely identical factual information as Fact '{fact:right}'"
         try:
             if len(topology_hist_edges) > 0:
-                dup_matches = cur_edge_df.sem_join(topology_hist_edges, dup_prompt)
+                dup_matches, q5_join_stats, q5_cascade_used = sem_join_with_optional_cascade(
+                    cur_edge_df, topology_hist_edges, dup_prompt
+                )
             else:
                 dup_matches = pd.DataFrame()
-            log_operation("Q5_sem_join", dup_prompt, cur_edge_df, dup_matches)
+                q5_join_stats, q5_cascade_used = None, False
+            extra = {"cascade_enabled": q5_cascade_used}
+            if q5_join_stats is not None:
+                extra["cascade_stats"] = q5_join_stats
+            log_operation("Q5_sem_join", dup_prompt, cur_edge_df, dup_matches, extra=extra)
             if len(dup_matches) > 0:
                 is_dup = True
                 print("      [Q5] DUP DETECTED.")
@@ -328,8 +524,13 @@ for msg_idx in range(len(messages)):
             contra_prompt = "Fact '{fact:left}' fundamentally contradicts or supersedes Fact '{fact:right}'"
             try:
                 # Assuming loose topology, cross-check against all active
-                contra_matches = cur_edge_df.sem_join(active_hist_edges, contra_prompt)
-                log_operation("Q6_sem_join", contra_prompt, cur_edge_df, contra_matches)
+                contra_matches, q6_join_stats, q6_cascade_used = sem_join_with_optional_cascade(
+                    cur_edge_df, active_hist_edges, contra_prompt
+                )
+                extra = {"cascade_enabled": q6_cascade_used}
+                if q6_join_stats is not None:
+                    extra["cascade_stats"] = q6_join_stats
+                log_operation("Q6_sem_join", contra_prompt, cur_edge_df, contra_matches, extra=extra)
                 if len(contra_matches) > 0:
                     is_contra = True
                     print(f"      [Q6] CONTRADICTION DETECTED. Invalidating {len(contra_matches)} old facts.")
@@ -351,6 +552,30 @@ for msg_idx in range(len(messages)):
     # ══════════════════════════════════════════════════════════
     # PHASE 3: COMMUNITY UPDATE (SIMULATING ZEP'S N->1 RACE LOOP)
     # ══════════════════════════════════════════════════════════
+    # Optional one-time bootstrap: run standalone community build so insertion updates can start working.
+    if (
+        not auto_build_done
+        and len(history_communities_df) == 0
+        and (msg_idx + 1) >= AUTO_BUILD_COMMUNITIES_AFTER_MSG
+    ):
+        print(
+            f"  [BUILD] Triggering one-time build_communities snapshot at msg {msg_idx + 1}..."
+        )
+        (
+            history_communities_df,
+            community_membership,
+            comm_counter,
+            built_count,
+        ) = build_initial_communities_once(
+            history_entities_df,
+            history_edges_df,
+            history_communities_df,
+            community_membership,
+            comm_counter,
+        )
+        auto_build_done = True
+        print(f"  [BUILD] Communities built: {built_count}")
+
     # Zep insertion only updates EXISTING communities. It does not create/rebuild communities here.
     # If no communities were built beforehand, this phase effectively does nothing.
     active_edges_for_community = history_edges_df[history_edges_df["invalidated"] == False]
@@ -424,6 +649,7 @@ exec_log["summary"] = {
     "virtual_cost_usd": lm.stats.virtual_usage.total_cost,
     "physical_cost_usd": lm.stats.physical_usage.total_cost,
     "cache_hits": lm.stats.cache_hits,
+    "operator_cache_hits": lm.stats.operator_cache_hits,
 }
 with open(LOG_JSON_PATH, "w") as f:
     json.dump(exec_log, f, indent=2, ensure_ascii=False)
