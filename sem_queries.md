@@ -64,10 +64,11 @@ CURRENT_FACTS = sem_map(
 )
 
 -- Q2: Retrieve facts from history that are similar to current facts
-SELECTED_HISTORY_FACTS = sem_topk(
+SELECTED_HISTORY_FACTS = CURRENT_FACTS left sem_sim_join lateral HISTORY_FACTS
+on (
     CURRENT_FACTS.fact, HISTORY_FACTS.fact,
-    k=5, "find top k similar facts"
-) -- just vector similarity search
+    K=5, "find top k similar facts"
+) -- per-left-row top-k vector similarity retrieval (kNN join)
 
 -- Q3: Fact resolution: give the memory action for each fact 'row' in a joint table
 -- of current facts and selected history facts (cross join lateral)
@@ -103,10 +104,11 @@ CURRENT_RELATIONS = sem_map(
 )   -- returns: (src_entity_name, relation_description, dest_entity_name)
 
 -- Q7: Retrieve entities from history that are similar to current entities
-SELECTED_HISTORY_ENTITIES = sem_topk(
+SELECTED_HISTORY_ENTITIES = CURRENT_ENTITIES left sem_sim_join lateral HISTORY_ENTITIES
+on (
     CURRENT_ENTITIES.entity_name, HISTORY_ENTITIES.entity_name,
-    k=1, threshold=0.8, "find top k similar entities"
-) -- top1 vector search
+    K=1, "find top k similar entities"
+) -- per-left-row top1 vector similarity retrieval
 
 -- Q8: Add a column of 'resolved id' for each entity in CURRENT_ENTITIES: reuse the id of the history entity if it is the same, otherwise generate a new id
 CURRENT_ENTITIES left sem_join lateral SELECTED_HISTORY_ENTITIES
@@ -197,8 +199,7 @@ sem_agg(
 | `sem_filter` | — | — | Q1 | 1 |
 | `sem_agg` | — | — | Q7 | 1 |
 | `sem_extract` | — | — | Q4, Q5 | 2 |
-| `sem_topk` | — | Q2, Q7 | — | 2 |
-| `sem_sim_join` | — | — | Q6 | 1 |
+| `sem_sim_join` | — | Q2, Q7 | Q6 | 3 |
 
 ---
 
@@ -328,7 +329,7 @@ current_relations = current_entities.sem_extract(
 candidates = current_entities.sem_sim_join(
     history_entities,
     left_on="entity_name", right_on="entity_name",
-    K=1, threshold=0.8
+    K=1
 )
 # Step 2: LLM precision judge
 aligned = candidates.sem_filter(
