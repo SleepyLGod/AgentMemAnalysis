@@ -31,16 +31,42 @@ import lotus
 from lotus.models import LM, SentenceTransformersRM
 from lotus.vector_store import FaissVS
 from lotus_opt_config import build_cascade_args, load_opt_config
+from sim_config import (
+    build_resolved_config_snapshot,
+    get_pipeline_helper_model,
+    get_pipeline_main_model,
+    get_pipeline_settings,
+    load_sim_config,
+)
 
 # ─────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────
-LOCOMO_PATH = Path("../evermemos/evaluation/data/locomo/locomo10.json")
-CONV_INDEX = 0                  
-MAX_MESSAGES = 40               # Expanded for fuller request coverage
-SLIDING_WINDOW_SIZE = 10        # Simulate Zep's Limit 10 context window retrieved per message
-AUTO_BUILD_COMMUNITIES_AFTER_MSG = 6  # Build communities once after N processed messages
-OPT_CONFIG = load_opt_config()
+PIPELINE_NAME = "zep"
+SIM_CONFIG = load_sim_config()
+PIPELINE_CONFIG = get_pipeline_settings(SIM_CONFIG, PIPELINE_NAME)
+MAIN_MODEL_CONFIG = get_pipeline_main_model(SIM_CONFIG, PIPELINE_NAME)
+HELPER_MODEL_CONFIG = get_pipeline_helper_model(SIM_CONFIG, PIPELINE_NAME)
+OPTIMIZATION_CONFIG = SIM_CONFIG.optimizations
+
+LOCOMO_PATH = SIM_CONFIG.global_config.locomo_path
+CONV_INDEX = SIM_CONFIG.global_config.conv_index
+MAX_MESSAGES = PIPELINE_CONFIG.max_messages
+SLIDING_WINDOW_SIZE = PIPELINE_CONFIG.sliding_window_size
+AUTO_BUILD_COMMUNITIES_AFTER_MSG = PIPELINE_CONFIG.auto_build_communities_after_msg
+OPT_CONFIG = load_opt_config(
+    filter_cascade_enabled=OPTIMIZATION_CONFIG.filter_cascade_enabled,
+    join_cascade_enabled=OPTIMIZATION_CONFIG.join_cascade_enabled,
+    topk_cascade_enabled=OPTIMIZATION_CONFIG.topk_cascade_enabled,
+    proxy_model=OPTIMIZATION_CONFIG.proxy_model,
+    recall_target=OPTIMIZATION_CONFIG.recall_target,
+    precision_target=OPTIMIZATION_CONFIG.precision_target,
+    failure_probability=OPTIMIZATION_CONFIG.failure_probability,
+    sampling_percentage=OPTIMIZATION_CONFIG.sampling_percentage,
+    min_join_cascade_size=OPTIMIZATION_CONFIG.min_join_cascade_size,
+    helper_model=HELPER_MODEL_CONFIG.model if HELPER_MODEL_CONFIG.enabled else None,
+)
+RESOLVED_CONFIG = build_resolved_config_snapshot(SIM_CONFIG, PIPELINE_NAME)
 
 timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 LOG_JSON_PATH = Path(f"zep_execution_log_{timestamp_str}.json")
@@ -52,32 +78,44 @@ print("=" * 60)
 print("Setting up LOTUS for Zep / Graphiti Pipeline")
 print("=" * 60)
 
-lm = LM(model="deepseek/deepseek-chat", max_tokens=1000, temperature=0.0, max_batch_size=2)
-rm = SentenceTransformersRM(model="intfloat/e5-base-v2")
+lm = LM(
+    model=MAIN_MODEL_CONFIG.model,
+    max_tokens=MAIN_MODEL_CONFIG.max_tokens,
+    temperature=MAIN_MODEL_CONFIG.temperature,
+    max_batch_size=MAIN_MODEL_CONFIG.max_batch_size,
+    **MAIN_MODEL_CONFIG.kwargs,
+)
+rm = SentenceTransformersRM(model=SIM_CONFIG.rm_model.model)
 vs = FaissVS()
 helper_lm = None
 effective_proxy_model = OPT_CONFIG.proxy_model
 if OPT_CONFIG.proxy_model == "helper_lm":
     if OPT_CONFIG.helper_model:
         helper_lm = LM(
-            model=OPT_CONFIG.helper_model,
-            max_tokens=1000,
-            temperature=0.0,
-            max_batch_size=2,
+            model=HELPER_MODEL_CONFIG.model,
+            max_tokens=HELPER_MODEL_CONFIG.max_tokens,
+            temperature=HELPER_MODEL_CONFIG.temperature,
+            max_batch_size=HELPER_MODEL_CONFIG.max_batch_size,
+            **HELPER_MODEL_CONFIG.kwargs,
         )
-        print(f"[OPT] Helper LM enabled: {OPT_CONFIG.helper_model}")
+        print(f"[OPT] Helper LM enabled: {HELPER_MODEL_CONFIG.model}")
     else:
         effective_proxy_model = "embedding"
         print(
-            "[OPT] LOTUS_OPT_PROXY_MODEL=helper_lm but LOTUS_HELPER_MODEL is unset. "
+            "[OPT] proxy_model=helper_lm but helper model is not configured. "
             "Falling back to embedding proxy."
         )
 
-configure_kwargs = {"lm": lm, "rm": rm, "vs": vs, "enable_cache": True}
+configure_kwargs = {
+    "lm": lm,
+    "rm": rm,
+    "vs": vs,
+    "enable_cache": SIM_CONFIG.global_config.enable_cache,
+}
 if helper_lm is not None:
     configure_kwargs["helper_lm"] = helper_lm
 lotus.settings.configure(**configure_kwargs)
-print("LOTUS cache enabled.")
+print(f"LOTUS cache enabled={SIM_CONFIG.global_config.enable_cache}.")
 FILTER_CASCADE_ARGS = (
     build_cascade_args(OPT_CONFIG, effective_proxy_model)
     if OPT_CONFIG.filter_cascade_enabled
@@ -102,6 +140,10 @@ print(
 exec_log = {
     "start_time": datetime.now().isoformat(),
     "config": {
+        "config_path": str(SIM_CONFIG.config_path),
+        "resolved_config": RESOLVED_CONFIG,
+        "locomo_path": str(LOCOMO_PATH),
+        "conv_index": CONV_INDEX,
         "max_messages": MAX_MESSAGES,
         "window": SLIDING_WINDOW_SIZE,
         "optimizations": {

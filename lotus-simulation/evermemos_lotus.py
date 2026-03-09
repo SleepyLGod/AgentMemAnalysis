@@ -52,18 +52,44 @@ import lotus
 from lotus.models import LM, SentenceTransformersRM
 from lotus.vector_store import FaissVS
 from lotus_opt_config import build_cascade_args, load_opt_config
+from sim_config import (
+    build_resolved_config_snapshot,
+    get_pipeline_helper_model,
+    get_pipeline_main_model,
+    get_pipeline_settings,
+    load_sim_config,
+)
 
 # ─────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────
-LOCOMO_PATH = Path("../evermemos/evaluation/data/locomo/locomo10.json")
-CONV_INDEX = 0                  # which conversation to process
-MAX_MESSAGES = 40               # truncate to first N messages for testing
-BOUNDARY_MSG_THRESHOLD = 15     # force boundary if >= N messages accumulated
-TOPIC_SIM_THRESHOLD = 0.5       # cosine similarity threshold for topic matching
-TOPIC_MAX_GAP_DAYS = 7          # only applied when both timestamps are parseable
-PROFILE_MIN_SEGMENTS = 2        # min segments in a topic before profile distillation
-OPT_CONFIG = load_opt_config()
+PIPELINE_NAME = "evermemos"
+SIM_CONFIG = load_sim_config()
+PIPELINE_CONFIG = get_pipeline_settings(SIM_CONFIG, PIPELINE_NAME)
+MAIN_MODEL_CONFIG = get_pipeline_main_model(SIM_CONFIG, PIPELINE_NAME)
+HELPER_MODEL_CONFIG = get_pipeline_helper_model(SIM_CONFIG, PIPELINE_NAME)
+OPTIMIZATION_CONFIG = SIM_CONFIG.optimizations
+
+LOCOMO_PATH = SIM_CONFIG.global_config.locomo_path
+CONV_INDEX = SIM_CONFIG.global_config.conv_index
+MAX_MESSAGES = PIPELINE_CONFIG.max_messages
+BOUNDARY_MSG_THRESHOLD = PIPELINE_CONFIG.boundary_msg_threshold
+TOPIC_SIM_THRESHOLD = PIPELINE_CONFIG.topic_sim_threshold
+TOPIC_MAX_GAP_DAYS = PIPELINE_CONFIG.topic_max_gap_days
+PROFILE_MIN_SEGMENTS = PIPELINE_CONFIG.profile_min_segments
+OPT_CONFIG = load_opt_config(
+    filter_cascade_enabled=OPTIMIZATION_CONFIG.filter_cascade_enabled,
+    join_cascade_enabled=OPTIMIZATION_CONFIG.join_cascade_enabled,
+    topk_cascade_enabled=OPTIMIZATION_CONFIG.topk_cascade_enabled,
+    proxy_model=OPTIMIZATION_CONFIG.proxy_model,
+    recall_target=OPTIMIZATION_CONFIG.recall_target,
+    precision_target=OPTIMIZATION_CONFIG.precision_target,
+    failure_probability=OPTIMIZATION_CONFIG.failure_probability,
+    sampling_percentage=OPTIMIZATION_CONFIG.sampling_percentage,
+    min_join_cascade_size=OPTIMIZATION_CONFIG.min_join_cascade_size,
+    helper_model=HELPER_MODEL_CONFIG.model if HELPER_MODEL_CONFIG.enabled else None,
+)
+RESOLVED_CONFIG = build_resolved_config_snapshot(SIM_CONFIG, PIPELINE_NAME)
 
 timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 LOG_JSON_PATH = Path(f"lotus_execution_log_{timestamp_str}.json")
@@ -78,37 +104,44 @@ print("=" * 60)
 # We use DeepSeek Chat. Set retry max and rate limits to be safe.
 # We also enable cache so we don't pay for re-runs.
 lm = LM(
-    model="deepseek/deepseek-chat",
-    max_tokens=1024,
-    temperature=0.0,
-    max_batch_size=4,    # conservative to avoid rate limits
+    model=MAIN_MODEL_CONFIG.model,
+    max_tokens=MAIN_MODEL_CONFIG.max_tokens,
+    temperature=MAIN_MODEL_CONFIG.temperature,
+    max_batch_size=MAIN_MODEL_CONFIG.max_batch_size,
+    **MAIN_MODEL_CONFIG.kwargs,
 )
-rm = SentenceTransformersRM(model="intfloat/e5-base-v2")
+rm = SentenceTransformersRM(model=SIM_CONFIG.rm_model.model)
 vs = FaissVS()
 helper_lm = None
 effective_proxy_model = OPT_CONFIG.proxy_model
 if OPT_CONFIG.proxy_model == "helper_lm":
     if OPT_CONFIG.helper_model:
         helper_lm = LM(
-            model=OPT_CONFIG.helper_model,
-            max_tokens=1024,
-            temperature=0.0,
-            max_batch_size=4,
+            model=HELPER_MODEL_CONFIG.model,
+            max_tokens=HELPER_MODEL_CONFIG.max_tokens,
+            temperature=HELPER_MODEL_CONFIG.temperature,
+            max_batch_size=HELPER_MODEL_CONFIG.max_batch_size,
+            **HELPER_MODEL_CONFIG.kwargs,
         )
-        print(f"[OPT] Helper LM enabled: {OPT_CONFIG.helper_model}")
+        print(f"[OPT] Helper LM enabled: {HELPER_MODEL_CONFIG.model}")
     else:
         effective_proxy_model = "embedding"
         print(
-            "[OPT] LOTUS_OPT_PROXY_MODEL=helper_lm but LOTUS_HELPER_MODEL is unset. "
+            "[OPT] proxy_model=helper_lm but helper model is not configured. "
             "Falling back to embedding proxy."
         )
 
 # Enable LOTUS cache (it creates a .lotus_cache directory by default)
-configure_kwargs = {"lm": lm, "rm": rm, "vs": vs, "enable_cache": True}
+configure_kwargs = {
+    "lm": lm,
+    "rm": rm,
+    "vs": vs,
+    "enable_cache": SIM_CONFIG.global_config.enable_cache,
+}
 if helper_lm is not None:
     configure_kwargs["helper_lm"] = helper_lm
 lotus.settings.configure(**configure_kwargs)
-print("LOTUS cache enabled (saves tokens on re-runs).")
+print(f"LOTUS cache enabled={SIM_CONFIG.global_config.enable_cache}.")
 FILTER_CASCADE_ARGS = (
     build_cascade_args(OPT_CONFIG, effective_proxy_model)
     if OPT_CONFIG.filter_cascade_enabled
@@ -133,6 +166,10 @@ print(
 exec_log = {
     "start_time": datetime.now().isoformat(),
     "config": {
+        "config_path": str(SIM_CONFIG.config_path),
+        "resolved_config": RESOLVED_CONFIG,
+        "locomo_path": str(LOCOMO_PATH),
+        "conv_index": CONV_INDEX,
         "max_messages": MAX_MESSAGES,
         "boundary_threshold": BOUNDARY_MSG_THRESHOLD,
         "topic_threshold": TOPIC_SIM_THRESHOLD,

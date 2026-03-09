@@ -5,48 +5,28 @@ LOTUS-based simulation scripts for three agent-memory insertion pipelines:
 - `evermemos_lotus.py`
 - `zep_lotus.py`
 
-Each script runs on LOCOMO conversation data, calls an LLM via LiteLLM, and writes a full JSON execution log.
+All non-secret runtime settings are loaded from YAML (`config.yaml` by default).
+Secrets stay in environment variables.
 
-## 1) Environment Setup
+## Environment Setup
 
-From `lotus-simulation`:
+From `/Users/von/Projects/AgentMemAnalysis/lotus-simulation`:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -e ../lotus
-pip install python-dotenv
+pip install python-dotenv pyyaml
 ```
 
-Set API key in repo root `.env` (or shell env):
+Set API key in shell or repo `.env`:
 
 ```bash
 DEEPSEEK_API_KEY=your_key_here
 ```
 
-Notes:
-- Python: `>=3.10,<3.13` (aligned with LOTUS).
-- All scripts use `lotus.settings.configure(..., enable_cache=True)`.
-- Default LOTUS cache in this setup is exact-input hash cache (in-memory per process).
-- All optimization toggles are OFF by default, so baseline behavior is unchanged.
-
-Optional optimization env vars (all default OFF / baseline-equivalent):
-
-```bash
-LOTUS_OPT_FILTER_CASCADE=0
-LOTUS_OPT_JOIN_CASCADE=0
-LOTUS_OPT_TOPK_CASCADE=0
-LOTUS_OPT_PROXY_MODEL=embedding      # embedding | helper_lm
-LOTUS_OPT_RECALL_TARGET=0.9
-LOTUS_OPT_PRECISION_TARGET=0.9
-LOTUS_OPT_FAILURE_PROB=0.2
-LOTUS_OPT_SAMPLING_PCT=0.2
-LOTUS_OPT_MIN_JOIN_CASCADE_SIZE=100
-LOTUS_HELPER_MODEL=                  # required only when LOTUS_OPT_PROXY_MODEL=helper_lm
-```
-
-## 2) Run
+## Run
 
 ```bash
 cd /Users/von/Projects/AgentMemAnalysis/lotus-simulation
@@ -57,70 +37,10 @@ python evermemos_lotus.py
 python zep_lotus.py
 ```
 
-### Run with env vars (copy/paste)
-
-Baseline (all optimizations OFF, behavior-equivalent to original flow):
+Use a custom config file:
 
 ```bash
-cd /Users/von/Projects/AgentMemAnalysis/lotus-simulation
-source .venv/bin/activate
-
-export LOTUS_OPT_FILTER_CASCADE=0
-export LOTUS_OPT_JOIN_CASCADE=0
-export LOTUS_OPT_TOPK_CASCADE=0
-
-python mem0_lotus.py
-python evermemos_lotus.py
-python zep_lotus.py
-```
-
-Join cascade only (mainly affects `zep_lotus.py`):
-
-```bash
-cd /Users/von/Projects/AgentMemAnalysis/lotus-simulation
-source .venv/bin/activate
-
-export LOTUS_OPT_JOIN_CASCADE=1
-export LOTUS_OPT_FILTER_CASCADE=0
-export LOTUS_OPT_PROXY_MODEL=embedding
-export LOTUS_OPT_RECALL_TARGET=0.9
-export LOTUS_OPT_PRECISION_TARGET=0.9
-export LOTUS_OPT_FAILURE_PROB=0.2
-export LOTUS_OPT_SAMPLING_PCT=0.2
-export LOTUS_OPT_MIN_JOIN_CASCADE_SIZE=100
-
-python zep_lotus.py
-```
-
-Filter cascade only (affects `mem0_lotus.py` Q8 and `evermemos_lotus.py` Q1):
-
-```bash
-cd /Users/von/Projects/AgentMemAnalysis/lotus-simulation
-source .venv/bin/activate
-
-export LOTUS_OPT_FILTER_CASCADE=1
-export LOTUS_OPT_JOIN_CASCADE=0
-export LOTUS_OPT_PROXY_MODEL=embedding
-export LOTUS_OPT_RECALL_TARGET=0.9
-export LOTUS_OPT_PRECISION_TARGET=0.9
-export LOTUS_OPT_FAILURE_PROB=0.2
-export LOTUS_OPT_SAMPLING_PCT=0.2
-
-python mem0_lotus.py
-python evermemos_lotus.py
-```
-
-Helper-LM proxy for cascade (optional):
-
-```bash
-cd /Users/von/Projects/AgentMemAnalysis/lotus-simulation
-source .venv/bin/activate
-
-export LOTUS_OPT_FILTER_CASCADE=1
-export LOTUS_OPT_PROXY_MODEL=helper_lm
-export LOTUS_HELPER_MODEL=deepseek/deepseek-chat
-
-python evermemos_lotus.py
+LOTUS_SIM_CONFIG_PATH=/abs/path/config.yaml python mem0_lotus.py
 ```
 
 Generated logs:
@@ -128,22 +48,108 @@ Generated logs:
 - `lotus_execution_log_YYYYMMDD_HHMMSS.json` (EverMemOS simulation)
 - `zep_execution_log_YYYYMMDD_HHMMSS.json`
 
-## 3) Script Overview
+## Configuration
 
-### `mem0_lotus.py`
-- Simulates Mem0 insertion workflow with LOTUS semantic operators.
-- Core stages: fact/entity/relation extraction, similarity recall, conflict/no-op/new-memory decisions.
-- Creates local FAISS index folders: `mem0_fact_idx/`, `mem0_ent_idx/`, `mem0_rel_idx/`.
-- Default scope: first `40` messages.
+Default file: `/Users/von/Projects/AgentMemAnalysis/lotus-simulation/config.yaml`
 
-### `evermemos_lotus.py`
-- Simulates EverMemOS segment/topic/profile insertion workflow.
-- Core stages: boundary detection, segment extraction, topic assignment/creation, profile distillation.
-- Includes optional time-gap gating when session timestamps are parseable.
-- Default scope: first `40` messages.
+Top-level schema:
+- `global`: `locomo_path`, `conv_index`, `enable_cache`
+- `models.main`: main LM config
+- `models.helper`: helper LM config
+- `models.rm`: retrieval model (embedding)
+- `optimizations`: cascade/proxy settings
+- `pipelines.mem0`: Mem0-specific settings
+- `pipelines.zep`: Zep-specific settings
+- `pipelines.evermemos`: EverMemOS-specific settings
 
-### `zep_lotus.py`
-- Simulates Graphiti/Zep insertion workflow.
-- Core stages: node/edge extraction, entity resolution, edge dedup/contradiction checks, summary refresh.
-- Includes one-time optional community bootstrap (`AUTO_BUILD_COMMUNITIES_AFTER_MSG`) before insertion-time community updates.
-- Default scope: first `40` messages, sliding context window `10`.
+Minimal template:
+
+```yaml
+global:
+  locomo_path: ../evermemos/evaluation/data/locomo/locomo10.json
+  conv_index: 0
+  enable_cache: true
+
+models:
+  main:
+    model: deepseek/deepseek-chat
+    max_tokens: 1000
+    temperature: 0.0
+    max_batch_size: 2
+    kwargs: {}
+  helper:
+    enabled: false
+    model: ""
+    max_tokens: 1000
+    temperature: 0.0
+    max_batch_size: 2
+    kwargs: {}
+  rm:
+    model: intfloat/e5-base-v2
+
+optimizations:
+  filter_cascade_enabled: false
+  join_cascade_enabled: false
+  topk_cascade_enabled: false
+  proxy_model: embedding
+  recall_target: 0.9
+  precision_target: 0.9
+  failure_probability: 0.2
+  sampling_percentage: 0.2
+  min_join_cascade_size: 100
+
+pipelines:
+  mem0:
+    max_messages: 40
+    sim_noop_threshold: 0.92
+  zep:
+    max_messages: 40
+    sliding_window_size: 10
+    auto_build_communities_after_msg: 6
+  evermemos:
+    max_messages: 40
+    boundary_msg_threshold: 15
+    topic_sim_threshold: 0.5
+    topic_max_gap_days: 7
+    profile_min_segments: 2
+```
+
+## Helper LM Examples
+
+Helper LM is configured in YAML and only used when:
+- `optimizations.proxy_model: helper_lm`
+- `models.helper.enabled: true`
+- `models.helper.model` is non-empty
+
+Example 1 (hosted API helper):
+
+```yaml
+models:
+  helper:
+    enabled: true
+    model: deepseek/deepseek-chat
+    max_tokens: 1000
+    temperature: 0.0
+    max_batch_size: 2
+    kwargs: {}
+```
+
+Example 2 (local vLLM helper, e.g. Qwen/Llama):
+
+```yaml
+models:
+  helper:
+    enabled: true
+    model: hosted_vllm/Qwen/Qwen2.5-7B-Instruct
+    max_tokens: 512
+    temperature: 0.0
+    max_batch_size: 8
+    kwargs:
+      api_base: http://127.0.0.1:8000/v1
+      api_key: EMPTY
+```
+
+Notes:
+- LOTUS `sem_filter` cascade supports both embedding proxy and helper-LM proxy.
+- LOTUS `sem_join` cascade is primarily similarity-proxy driven in current code path; helper LM is not the main join proxy path.
+- All optimization switches default to OFF in `config.yaml`, so baseline behavior remains unchanged.
