@@ -18,7 +18,10 @@ models:
     max_batch_size: 2
     kwargs: {}
   rm:
+    backend: hashing
     model: intfloat/e5-base-v2
+    kwargs:
+      dim: 1024
 
 optimizations:
   filter_cascade_enabled: false

@@ -49,10 +49,12 @@ load_dotenv()
 os.environ["DEEPSEEK_API_KEY"] = os.getenv("DEEPSEEK_API_KEY", "")
 
 import lotus
-from lotus.models import LM, SentenceTransformersRM
+from lotus.models.lm import LM
 from lotus.vector_store import FaissVS
-from lotus_opt_config import build_cascade_args, load_opt_config
+from rm_factory import build_rm
 from sim_config import (
+    build_cascade_args,
+    build_opt_config,
     build_resolved_config_snapshot,
     get_pipeline_helper_model,
     get_pipeline_main_model,
@@ -77,17 +79,9 @@ BOUNDARY_MSG_THRESHOLD = PIPELINE_CONFIG.boundary_msg_threshold
 TOPIC_SIM_THRESHOLD = PIPELINE_CONFIG.topic_sim_threshold
 TOPIC_MAX_GAP_DAYS = PIPELINE_CONFIG.topic_max_gap_days
 PROFILE_MIN_SEGMENTS = PIPELINE_CONFIG.profile_min_segments
-OPT_CONFIG = load_opt_config(
-    filter_cascade_enabled=OPTIMIZATION_CONFIG.filter_cascade_enabled,
-    join_cascade_enabled=OPTIMIZATION_CONFIG.join_cascade_enabled,
-    topk_cascade_enabled=OPTIMIZATION_CONFIG.topk_cascade_enabled,
-    proxy_model=OPTIMIZATION_CONFIG.proxy_model,
-    recall_target=OPTIMIZATION_CONFIG.recall_target,
-    precision_target=OPTIMIZATION_CONFIG.precision_target,
-    failure_probability=OPTIMIZATION_CONFIG.failure_probability,
-    sampling_percentage=OPTIMIZATION_CONFIG.sampling_percentage,
-    min_join_cascade_size=OPTIMIZATION_CONFIG.min_join_cascade_size,
-    helper_model=HELPER_MODEL_CONFIG.model if HELPER_MODEL_CONFIG.enabled else None,
+OPT_CONFIG = build_opt_config(
+    optimizations=OPTIMIZATION_CONFIG,
+    helper_model=HELPER_MODEL_CONFIG,
 )
 RESOLVED_CONFIG = build_resolved_config_snapshot(SIM_CONFIG, PIPELINE_NAME)
 
@@ -110,7 +104,8 @@ lm = LM(
     max_batch_size=MAIN_MODEL_CONFIG.max_batch_size,
     **MAIN_MODEL_CONFIG.kwargs,
 )
-rm = SentenceTransformersRM(model=SIM_CONFIG.rm_model.model)
+rm = build_rm(SIM_CONFIG.rm_model)
+print(f"[RM] backend={SIM_CONFIG.rm_model.backend} model={SIM_CONFIG.rm_model.model}")
 vs = FaissVS()
 helper_lm = None
 effective_proxy_model = OPT_CONFIG.proxy_model

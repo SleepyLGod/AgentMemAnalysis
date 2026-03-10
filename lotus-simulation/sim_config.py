@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,11 @@ DEFAULT_SIM_CONFIG: dict[str, Any] = {
             "max_batch_size": 2,
             "kwargs": {},
         },
-        "rm": {"model": "intfloat/e5-base-v2"},
+        "rm": {
+            "backend": "hashing",
+            "model": "intfloat/e5-base-v2",
+            "kwargs": {"dim": 1024},
+        },
     },
     "optimizations": {
         "filter_cascade_enabled": False,
@@ -105,7 +110,9 @@ class HelperLMConfig:
 
 @dataclass(frozen=True)
 class RMConfig:
+    backend: str
     model: str
+    kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -119,6 +126,20 @@ class OptimizationsConfig:
     failure_probability: float
     sampling_percentage: float
     min_join_cascade_size: int
+
+
+@dataclass(frozen=True)
+class LotusOptConfig:
+    filter_cascade_enabled: bool
+    join_cascade_enabled: bool
+    topk_cascade_enabled: bool
+    proxy_model: str
+    recall_target: float
+    precision_target: float
+    failure_probability: float
+    sampling_percentage: float
+    min_join_cascade_size: int
+    helper_model: str | None
 
 
 @dataclass(frozen=True)
@@ -207,6 +228,14 @@ def _build_helper_lm_config(cfg: dict[str, Any]) -> HelperLMConfig:
     )
 
 
+def _build_rm_config(cfg: dict[str, Any]) -> RMConfig:
+    return RMConfig(
+        backend=str(cfg.get("backend", "hashing")),
+        model=str(cfg.get("model", "intfloat/e5-base-v2")),
+        kwargs=_to_dict(cfg.get("kwargs"), {}),
+    )
+
+
 def _apply_model_overrides(model_cfg: LMConfig, overrides: dict[str, Any]) -> LMConfig:
     merged_kwargs = dict(model_cfg.kwargs)
     merged_kwargs.update(_to_dict(overrides.get("kwargs"), {}))
@@ -272,7 +301,7 @@ def load_sim_config() -> SimulationConfig:
         ),
         main_model=_build_lm_config(_to_dict(models_cfg.get("main"), {})),
         helper_model=_build_helper_lm_config(_to_dict(models_cfg.get("helper"), {})),
-        rm_model=RMConfig(model=str(_to_dict(models_cfg.get("rm"), {}).get("model", "intfloat/e5-base-v2"))),
+        rm_model=_build_rm_config(_to_dict(models_cfg.get("rm"), {})),
         optimizations=OptimizationsConfig(
             filter_cascade_enabled=bool(optim_cfg.get("filter_cascade_enabled", False)),
             join_cascade_enabled=bool(optim_cfg.get("join_cascade_enabled", False)),
@@ -344,3 +373,53 @@ def build_resolved_config_snapshot(
         },
     }
     return _path_to_str(snapshot)
+
+
+def _normalize_proxy_model(proxy_model: str) -> str:
+    lowered = proxy_model.strip().lower()
+    if lowered in {"embedding", "embedding_model"}:
+        return "embedding"
+    if lowered in {"helper_lm", "helper", "helper-model"}:
+        return "helper_lm"
+    warnings.warn(
+        f"Invalid proxy_model={proxy_model!r}; falling back to 'embedding'."
+    )
+    return "embedding"
+
+
+def build_opt_config(
+    *,
+    optimizations: OptimizationsConfig,
+    helper_model: HelperLMConfig,
+) -> LotusOptConfig:
+    helper_name = helper_model.model.strip() if helper_model.enabled else ""
+    return LotusOptConfig(
+        filter_cascade_enabled=optimizations.filter_cascade_enabled,
+        join_cascade_enabled=optimizations.join_cascade_enabled,
+        topk_cascade_enabled=optimizations.topk_cascade_enabled,
+        proxy_model=_normalize_proxy_model(optimizations.proxy_model),
+        recall_target=float(optimizations.recall_target),
+        precision_target=float(optimizations.precision_target),
+        failure_probability=float(optimizations.failure_probability),
+        sampling_percentage=float(optimizations.sampling_percentage),
+        min_join_cascade_size=int(optimizations.min_join_cascade_size),
+        helper_model=helper_name if helper_name else None,
+    )
+
+
+def build_cascade_args(config: LotusOptConfig, proxy_model_name: str):
+    from lotus.types import CascadeArgs, ProxyModel
+
+    proxy = (
+        ProxyModel.HELPER_LM
+        if proxy_model_name == "helper_lm"
+        else ProxyModel.EMBEDDING_MODEL
+    )
+    return CascadeArgs(
+        recall_target=config.recall_target,
+        precision_target=config.precision_target,
+        sampling_percentage=config.sampling_percentage,
+        failure_probability=config.failure_probability,
+        proxy_model=proxy,
+        min_join_cascade_size=config.min_join_cascade_size,
+    )
