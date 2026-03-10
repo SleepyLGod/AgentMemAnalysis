@@ -1,5 +1,5 @@
 global:
-  locomo_path: ../evermemos/evaluation/data/locomo/locomo10.json
+  locomo_path: ../EverMemOS/evaluation/data/locomo/locomo10.json
   conv_index: 0
   enable_cache: true
 
@@ -11,12 +11,14 @@ models:
     max_batch_size: 2
     kwargs: {}
   helper:
-    enabled: false
-    model: ""
+    enabled: true
+    model: hosted_vllm/meta-llama/Llama-3.1-70B-Instruct # hosted_vllm/Qwen/Qwen2.5-7B-Instruct
     max_tokens: 1000
     temperature: 0.0
-    max_batch_size: 2
-    kwargs: {}
+    max_batch_size: 4 # 2
+    kwargs:
+      api_base: http://127.0.0.1:8001/v1
+      api_key: EMPTY
   rm:
     backend: hashing
     model: intfloat/e5-base-v2
@@ -24,30 +26,30 @@ models:
       dim: 1024
 
 optimizations:
-  filter_cascade_enabled: false
-  join_cascade_enabled: false
-  topk_cascade_enabled: false
-  proxy_model: embedding
+  filter_cascade_enabled: true
+  join_cascade_enabled: true
+  topk_cascade_enabled: true
+  proxy_model: helper_lm # embedding
   recall_target: 0.9
   precision_target: 0.9
   failure_probability: 0.2
-  sampling_percentage: 0.2
-  min_join_cascade_size: 100
+  sampling_percentage: 1.0 # 0.2
+  min_join_cascade_size: 1 # 100 -- to fulfill zep
 
 pipelines:
   mem0:
-    max_messages: 40
+    max_messages: 80 # 40
     sim_noop_threshold: 0.92
     main_lm_overrides: {}
     helper_lm_overrides: {}
   zep:
-    max_messages: 40
+    max_messages: 80 # 40
     sliding_window_size: 10
     auto_build_communities_after_msg: 6
     main_lm_overrides: {}
     helper_lm_overrides: {}
   evermemos:
-    max_messages: 40
+    max_messages: 80 # 40
     boundary_msg_threshold: 15
     topic_sim_threshold: 0.5
     topic_max_gap_days: 7
