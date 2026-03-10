@@ -12,7 +12,7 @@ import yaml
 
 DEFAULT_SIM_CONFIG: dict[str, Any] = {
     "global": {
-        "locomo_path": "../evermemos/evaluation/data/locomo/locomo10.json",
+        "locomo_path": "../EverMemOS/evaluation/data/locomo/locomo10.json",
         "conv_index": 0,
         "enable_cache": True,
     },

@@ -14,3 +14,6 @@ __pycache__
 *mem0_fact_idx*
 *mem0_rel_idx*
 *mem0_run.log*
+lotus-simulation/*/index*
+lotus-simulation/*/vecs
+lotus-simulation/*_run_*.log

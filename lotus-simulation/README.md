@@ -29,11 +29,7 @@ uv add --editable ../lotus
 uv add python-dotenv pyyaml
 ```
 
-Set API key in shell or repo `.env`:
-
-```bash
-DEEPSEEK_API_KEY=your_key_here
-```
+Set API key in shell or repo `.env`
 
 ## Run
 
