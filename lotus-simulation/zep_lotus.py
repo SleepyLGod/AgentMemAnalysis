@@ -19,6 +19,7 @@ import os
 import traceback
 from pathlib import Path
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -185,18 +186,47 @@ def sem_join_with_optional_cascade(
     left_df: pd.DataFrame,
     right_df: pd.DataFrame,
     join_prompt: str,
-) -> tuple[pd.DataFrame, dict | None, bool]:
+) -> tuple[pd.DataFrame, dict[str, Any] | None, bool]:
     if JOIN_CASCADE_ARGS is None:
         return left_df.sem_join(right_df, join_prompt), None, False
 
+    full_join_size = len(left_df) * len(right_df)
+    min_join_size = int(getattr(JOIN_CASCADE_ARGS, "min_join_cascade_size", 0) or 0)
+
+    # sem_join cascade only triggers when join cardinality reaches min_join_cascade_size.
+    if full_join_size < min_join_size:
+        joined_df = left_df.sem_join(right_df, join_prompt)
+        return joined_df, {
+            "cascade_skipped": "full_join_below_threshold",
+            "full_join_size": full_join_size,
+            "min_join_cascade_size": min_join_size,
+        }, False
+
     try:
-        joined_df, join_stats = left_df.sem_join(
+        join_result = left_df.sem_join(
             right_df,
             join_prompt,
             cascade_args=JOIN_CASCADE_ARGS,
             return_stats=True,
         )
-        return joined_df, join_stats, True
+
+        # LOTUS may return either:
+        # - (joined_df, stats) when cascade stats are available
+        # - joined_df only when stats are not produced
+        if isinstance(join_result, tuple):
+            if len(join_result) == 2:
+                joined_df, join_stats = join_result
+                return joined_df, join_stats, True
+            raise ValueError(f"Unexpected sem_join return tuple length: {len(join_result)}")
+
+        if isinstance(join_result, pd.DataFrame):
+            return join_result, {
+                "cascade_returned_no_stats": True,
+                "full_join_size": full_join_size,
+                "min_join_cascade_size": min_join_size,
+            }, False
+
+        raise TypeError(f"Unexpected sem_join return type: {type(join_result).__name__}")
     except Exception as cascade_err:
         print(
             "    [OPT] Join cascade failed "
