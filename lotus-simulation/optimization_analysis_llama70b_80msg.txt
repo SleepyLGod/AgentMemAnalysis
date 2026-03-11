@@ -1,0 +1,215 @@
+LOTUS Simulation Optimization Analysis (Llama-70B Helper, 80 Messages)
+Date: 2026-03-11
+Author: Codex (log-based analysis only)
+
+Scope
+- Latest run set (80 messages, helper model = Llama-70B via hosted_vllm):
+  - mem0_execution_log_20260310_181223.json
+  - lotus_execution_log_20260310_173205.json (EverMemOS pipeline)
+  - zep_execution_log_20260310_173727.json
+  - mem0_run_20260310_181220.log
+  - evermemos_run_20260310_173202.log
+  - zep_run_20260310_173723.log
+
+- No-optimization references available in workspace (40 messages):
+  - mem0_execution_log_20260309_214359.json
+  - lotus_execution_log_20260310_153342.json
+  - zep_execution_log_20260308_215223.json
+
+- Additional 40-message optimized references (same helper family, prior run):
+  - mem0_execution_log_20260310_153659.json
+  - lotus_execution_log_20260310_155027.json
+  - zep_execution_log_20260310_152222.json
+
+Important comparability note
+- There is no 80-message "optimizations OFF" baseline in current logs.
+- Therefore, this report provides:
+  1) absolute comparison against 40-message no-optimization logs, and
+  2) normalized per-message comparison to reduce message-count bias.
+
+Method
+- Parsed each JSON's config.resolved_config, config.optimizations, operations[], and summary.
+- Counted per-operator cascade activation (cascade_enabled), cascade_stats fields, fallback errors, and cache counters.
+- Measured runtime from start_time/end_time.
+- Cross-checked run logs for printed fallback/error signals and final usage snapshots.
+
+Accounting caveat
+- Script summary usage comes from main LM (lm.stats) only.
+- Helper LM (vLLM) cost/usage is not included in reported physical_cost_usd in these script summaries.
+- Any total-cost conclusion should include helper-side telemetry (vLLM metrics/logs).
+
+============================================================
+A) High-Level Findings
+============================================================
+1) Optimization activation status (80-message latest)
+- mem0: filter cascade fully active (Q8), no fallback errors.
+- evermemos: filter cascade fully active (Q1), no fallback errors.
+- zep: join cascade active in Q2/Q6; Q5 remains partially unstable with many fallback errors.
+
+2) Model routing status
+- In all latest 80-message runs, effective main model is still deepseek/deepseek-chat.
+- Llama-70B is configured and used as helper model pathway.
+
+3) Cache behavior
+- zep: very strong cache effects (cache_hits=6676, operator_cache_hits=230).
+- mem0: operator cache present (146) but LM exact cache remains 0.
+- evermemos: no cache benefit observed.
+
+============================================================
+B) Pipeline-by-Pipeline Detail
+============================================================
+
+B1) MEM0 (mem0_execution_log_20260310_181223.json)
+Config evidence
+- max_messages=80
+- proxy requested/effective: helper_lm -> helper_lm
+- optimization flags: filter/join/topk all true; min_join_cascade_size=1
+
+Observed behavior
+- total operations: 995 (all success)
+- Q8_sem_filter: 79/79 cascade_enabled=true
+- Q8 cascade aggregate:
+  - filters_resolved_by_helper_model = 79
+  - filters_resolved_by_large_model = 0
+  - num_routed_to_helper_model = 79
+- fallback errors: none in JSON and run log
+- summary:
+  - virtual_cost=0.020250
+  - physical_cost=0.018861
+  - cache_hits=0
+  - operator_cache_hits=146
+  - final facts/entities: 30 / 46
+
+Comparison vs 40-message no-optimization reference (mem0_execution_log_20260309_214359.json)
+- Absolute:
+  - runtime: 683.38s -> 931.70s (+36.3%)
+  - physical_cost: 0.007102 -> 0.018861 (+165.6%)
+- Per-message normalized:
+  - runtime per message: 17.08s -> 11.65s (-31.8%)
+  - physical_cost per message: 0.0001776 -> 0.0002358 (+32.8%)
+
+Interpretation
+- Cascade remains robustly active with full helper routing on Q8.
+- Throughput per message improved versus 40-message no-opt run, but main-LM cost per message increased.
+- Since helper cost is excluded, the full economic picture requires helper telemetry.
+
+B2) EVERMEMOS (lotus_execution_log_20260310_173205.json)
+Config evidence
+- max_messages=80
+- proxy requested/effective: helper_lm -> helper_lm
+- optimization flags enabled
+
+Observed behavior
+- total operations: 107 (all success)
+- Q1_sem_filter: 26/26 cascade_enabled=true
+- Q1 cascade aggregate:
+  - filters_resolved_by_helper_model = 26
+  - filters_resolved_by_large_model = 0
+  - num_routed_to_helper_model = 26
+- fallback errors: none in JSON and run log
+- summary:
+  - total_segments=26, total_topics=22
+  - physical_cost=0.005211
+  - cache_hits=0, operator_cache_hits=0
+
+Comparison vs 40-message no-optimization reference (lotus_execution_log_20260310_153342.json)
+- Absolute:
+  - runtime: 86.21s -> 211.84s (+145.7%)
+  - physical_cost: 0.002372 -> 0.005211 (+119.7%)
+- Per-message normalized:
+  - runtime per message: 2.16s -> 2.65s (+22.9%)
+  - physical_cost per message: 0.0000593 -> 0.0000651 (+9.8%)
+
+Interpretation
+- Cascade is active and helper-routed.
+- Larger message horizon significantly increased segmentation count (26), which amplified downstream extraction workload.
+- No cache cushion exists in this pipeline, so scaling overhead is directly exposed.
+
+B3) ZEP (zep_execution_log_20260310_173727.json)
+Config evidence
+- max_messages=80
+- proxy requested/effective: helper_lm -> helper_lm
+- optimization flags enabled; min_join_cascade_size=1
+
+Observed behavior
+- total operations: 362 (all success)
+- Q2_sem_join: 79/79 cascade_enabled=true
+- Q6_sem_join: 44/44 cascade_enabled=true
+- Q5_sem_join: 7/79 true, 72/79 false
+- Q5 fallback count from JSON: 45
+- run log confirms repeated fallback lines: "Join cascade failed (... index ... out of bounds ...)."
+- summary:
+  - virtual_cost=0.158524
+  - physical_cost=0.061613
+  - cache_hits=6676
+  - operator_cache_hits=230
+  - final nodes/active_edges/communities: 80 / 45 / 0
+
+Join cascade aggregate stats
+- Q2_sem_join:
+  - join_resolved_by_helper_model = 3386
+  - join_resolved_by_large_model = 2
+- Q6_sem_join:
+  - join_resolved_by_helper_model = 210
+  - join_resolved_by_large_model = 780
+- Q5_sem_join:
+  - mostly no-stats/fallback, only 7 join-stats instances
+
+Comparison vs 40-message no-optimization reference (zep_execution_log_20260308_215223.json)
+- Absolute:
+  - runtime: 629.04s -> 2031.24s (+222.9%)
+  - physical_cost: 0.013763 -> 0.061613 (+347.7%)
+- Per-message normalized:
+  - runtime per message: 15.73s -> 25.39s (+61.5%)
+  - physical_cost per message: 0.0003441 -> 0.0007702 (+123.8%)
+
+Interpretation
+- Optimization is active but join-heavy scaling dominates.
+- Q5 instability contributes meaningful overhead.
+- Cache improvements are very strong, but they do not offset increased join complexity at 80 messages.
+
+============================================================
+C) Why optimization helps some parts but not all
+============================================================
+1) Workflow structure
+- mem0/evermemos rely on sem_filter checkpoints where helper cascade cleanly routes many decisions.
+- zep is join-dominant; sem_join complexity grows with memory size and is more sensitive to cascade planning and data-shape edge cases.
+
+2) LOTUS operator behavior
+- sem_filter cascade (with helper proxy) is stable in these runs.
+- sem_join cascade is active but can encounter fallback in certain index/data patterns (seen repeatedly in zep Q5).
+
+3) Data-growth effects at 80 messages
+- Larger history increases candidate pairs and join/search workload.
+- evermemos creates more boundaries/segments with longer conversation horizon.
+- zep accumulates larger graph state, amplifying join passes and fallback exposure.
+
+============================================================
+D) Optimization Usage Matrix (Latest 80-Message Run)
+============================================================
+- mem0
+  - Used: filter cascade, operator cache
+  - Not used materially: LM exact cache
+  - Stability: high (no fallback)
+
+- evermemos
+  - Used: filter cascade
+  - Not used materially: cache
+  - Stability: high (no fallback)
+
+- zep
+  - Used: join cascade (Q2/Q6), LM cache, operator cache
+  - Partially unstable: Q5 join cascade fallback remains frequent
+  - Net: optimization active but scaling overhead still high at 80 messages
+
+============================================================
+E) Confidence and Limits
+============================================================
+- High confidence:
+  - activation/fallback/cache and per-operator counts (directly log-derived)
+  - model routing from resolved config
+- Medium confidence:
+  - total economic benefit due missing helper-LM accounting in summary fields
+- Out of scope:
+  - semantic quality/accuracy benchmarking (no external labels in this pass)
+

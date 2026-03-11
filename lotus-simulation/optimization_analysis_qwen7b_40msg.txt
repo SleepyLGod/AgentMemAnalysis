@@ -1,0 +1,216 @@
+LOTUS Simulation Optimization Analysis (Qwen-7B Helper Run)
+Date: 2026-03-11
+Author: Codex (log-based analysis only)
+
+Scope
+- Latest run set (user-indicated Qwen-7B helper configuration, 40 messages):
+  - mem0_execution_log_20260310_164629.json
+  - lotus_execution_log_20260310_165641.json (EverMemOS pipeline)
+  - zep_execution_log_20260310_165914.json
+  - mem0_run_20260310_164626.log
+  - evermemos_run_20260310_165638.log
+  - zep_run_20260310_165911.log
+- No-optimization baselines (closest 40-message references):
+  - mem0_execution_log_20260309_214359.json
+  - lotus_execution_log_20260310_153342.json
+  - zep_execution_log_20260308_215223.json
+- Supplemental comparison against prior optimized (Llama-70B helper) run:
+  - mem0_execution_log_20260310_153659.json
+  - lotus_execution_log_20260310_155027.json
+  - zep_execution_log_20260310_152222.json
+
+Method
+- Parsed config/summary/operations from each JSON.
+- Counted optimization activation per operator:
+  - cascade_enabled true/false
+  - cascade_stats keys and fallback errors
+  - cache_hits and operator_cache_hits
+- Compared runtime using start_time/end_time deltas.
+- Cross-checked terminal run logs for printed fallback messages.
+
+Important Accounting Caveat
+- Reported cost/tokens in these scripts are from main LM stats (lm.stats).
+- Helper LM (vLLM) usage cost is not included in these summary cost fields.
+- Therefore, "physical_cost_usd" here reflects main-model-side accounting, not full end-to-end system cost.
+
+============================================================
+A) High-Level Findings
+============================================================
+1) Was Qwen-7B helper actually used?
+- mem0: Yes. Q8 sem_filter cascade is active and helper-resolved.
+- evermemos: Yes. Q1 sem_filter cascade is active and helper-resolved.
+- zep: Join cascade is active, but sem_join helper path is still primarily similarity-proxy driven in LOTUS; this limits direct helper-lm usage impact in zep join-heavy workflow.
+
+2) Which LOTUS optimizations were active?
+- filter cascade: active in mem0 and evermemos.
+- join cascade: active in zep Q2/Q6 (partially unstable in Q5 due fallbacks).
+- cache:
+  - zep: strong LM cache benefit + increased operator cache hits.
+  - mem0: only operator cache observed.
+  - evermemos: no cache benefit observed.
+- sem_topk optimization: not used (no sem_topk insertion operator path in these scripts).
+
+3) Main-model routing status
+- In all three latest logs, effective main model remains deepseek/deepseek-chat.
+- Qwen-7B is configured as helper model, not main model.
+
+============================================================
+B) Pipeline-by-Pipeline Detail
+============================================================
+
+B1) MEM0 (latest: mem0_execution_log_20260310_164629.json)
+Config evidence
+- main: deepseek/deepseek-chat
+- helper: hosted_vllm/Qwen/Qwen2.5-7B-Instruct (enabled)
+- proxy requested/effective: helper_lm -> helper_lm
+- optimization flags: all true; min_join_cascade_size=1
+
+Observed optimization behavior
+- Q8_sem_filter: 39/39 cascade_enabled=true.
+- Q8 cascade stats aggregate:
+  - filters_resolved_by_helper_model = 39
+  - filters_resolved_by_large_model = 0
+  - num_routed_to_helper_model = 39
+- No cascade fallback errors in mem0.
+- cache_hits=0, operator_cache_hits=62.
+
+Outcome vs no-optimization baseline (mem0_execution_log_20260309_214359.json)
+- Runtime: 683.38s -> 521.32s (about -23.7%).
+- Physical cost: 0.007102 -> 0.006294 (about -11.4% on main-LM accounting).
+
+Supplemental vs prior optimized 70B helper (mem0_execution_log_20260310_153659.json)
+- Runtime: slightly faster (524.86s -> 521.32s).
+- Physical cost (main-LM accounting): slightly higher (0.006156 -> 0.006294).
+- Cascade behavior pattern is effectively identical in Q8 stats.
+
+Interpretation
+- mem0 remains a strong fit for filter-cascade optimization.
+- Qwen-7B helper provides comparable routing behavior to the previous optimized helper run on this dataset slice.
+
+B2) EVERMEMOS (latest: lotus_execution_log_20260310_165641.json)
+Config evidence
+- main: deepseek/deepseek-chat
+- helper: hosted_vllm/Qwen/Qwen2.5-7B-Instruct (enabled)
+- proxy requested/effective: helper_lm -> helper_lm
+- optimization flags: all true; min_join_cascade_size=1
+
+Observed optimization behavior
+- Q1_sem_filter: 13/13 cascade_enabled=true.
+- Q1 cascade stats aggregate:
+  - filters_resolved_by_helper_model = 13
+  - filters_resolved_by_large_model = 0
+  - num_routed_to_helper_model = 13
+- cache_hits=0, operator_cache_hits=0.
+- Run log confirms completion and segment count = 13.
+
+Outcome vs no-optimization baseline (lotus_execution_log_20260310_153342.json)
+- Runtime: 86.21s -> 118.11s (about +37.0%).
+- Physical cost: 0.002372 -> 0.001628 (about -31.4% on main-LM accounting).
+- Segments increased from 7 (baseline) to 13 (latest), which increases downstream operator count.
+
+Supplemental vs prior optimized 70B helper (lotus_execution_log_20260310_155027.json)
+- Runtime: higher (112.28s -> 118.11s).
+- Physical cost (main-LM accounting): lower (0.002816 -> 0.001628).
+- Cascade routing counts are identical at Q1 operator level.
+
+Interpretation
+- Cascade is active and helper-routing is consistent.
+- Overall runtime is sensitive to segmentation dynamics; more segments can raise total processing time even when helper handles boundary decisions.
+
+B3) ZEP (latest: zep_execution_log_20260310_165914.json)
+Config evidence
+- main: deepseek/deepseek-chat
+- helper: hosted_vllm/Qwen/Qwen2.5-7B-Instruct (enabled)
+- proxy requested/effective: helper_lm -> helper_lm
+- optimization flags: all true; min_join_cascade_size=1
+
+Observed optimization behavior
+- Q2_sem_join: 39/39 cascade_enabled=true.
+- Q6_sem_join: 23/23 cascade_enabled=true.
+- Q5_sem_join: 1/39 true, 38/39 false.
+- Q5 had 22 cascade_fallback_error cases.
+- zep run log prints repeated fallback messages:
+  - "Join cascade failed (... index ... out of bounds ...). Falling back to standard sem_join."
+- cache_hits=1692, operator_cache_hits=112.
+
+Join cascade stats aggregates
+- Q2_sem_join:
+  - join_resolved_by_helper_model = 984
+  - join_resolved_by_large_model = 2
+- Q6_sem_join:
+  - join_resolved_by_helper_model = 72
+  - join_resolved_by_large_model = 204
+- Q5_sem_join:
+  - mostly fallback/no-stats; only 1 join-stats instance recorded
+
+Outcome vs no-optimization baseline (zep_execution_log_20260308_215223.json)
+- Runtime: 629.04s -> 763.36s (about +21.4%).
+- Physical cost: 0.013763 -> 0.013349 (about -3.0% on main-LM accounting).
+- Cache behavior improved strongly:
+  - cache_hits: 752 -> 1692
+  - operator_cache_hits: 4 -> 112
+
+Supplemental vs prior optimized 70B helper (zep_execution_log_20260310_152222.json)
+- Runtime: slightly slower (746.65s -> 763.36s).
+- Physical cost (main-LM accounting): lower (0.015408 -> 0.013349).
+- Fallback count in Q5 reduced (24 -> 22), still materially present.
+
+Interpretation
+- zep optimization is active, but not uniformly stable due Q5 cascade fallback errors.
+- zep is join-heavy; current LOTUS join path limitations and fallback instability dominate outcome variance.
+- Main-model cost benefits are partly offset by added optimization overhead and fallback handling.
+
+============================================================
+C) Why zep still "looks less vLLM-driven" than mem0/evermemos
+============================================================
+1) zep insertion is dominated by sem_join operations.
+2) LOTUS sem_join optimizer currently centers on similarity-proxy path; helper-lm is not the primary join-proxy execution path.
+3) Therefore, even with helper_lm configured, zep's practical acceleration depends more on join-cascade behavior + cache + fallback rate than on direct helper-lm routing.
+
+============================================================
+D) Optimization Usage Matrix (Latest Qwen-7B Run)
+============================================================
+- mem0
+  - Filter cascade: Yes (Q8, fully active)
+  - Join cascade: Not a primary active path in insertion logic
+  - Cache: operator cache only (LM cache 0)
+  - Fallbacks: none
+
+- evermemos
+  - Filter cascade: Yes (Q1, fully active)
+  - Join/topk cascade: not used in insertion path
+  - Cache: none observed
+  - Fallbacks: none
+
+- zep
+  - Join cascade: Yes (Q2/Q6 active)
+  - Filter/topk cascade: not primary in zep insertion path
+  - Cache: strong LM cache + operator cache
+  - Fallbacks: present in Q5 join cascade
+
+============================================================
+E) Root-Cause Attribution
+============================================================
+Workflow-driven factors
+- mem0 and evermemos each have sem_filter choke points where helper cascade cleanly applies.
+- zep's core workload is sem_join-heavy and is more sensitive to join optimizer internals.
+
+LOTUS-implementation factors
+- sem_join helper-lm proxy path is not the dominant join optimization mechanism in the current code path.
+- join cascade can still work via similarity-proxy planning, but may incur instability in specific edge-cases.
+
+Script/data interaction factors
+- zep Q5 repeatedly triggers index out-of-bounds fallback under current data trajectory, reducing effective optimization coverage.
+- evermemos runtime is strongly impacted by boundary/segmentation outcomes, not only per-call cascade routing.
+
+============================================================
+F) Confidence and Limits
+============================================================
+- High confidence:
+  - activation/fallback/cache observations and counts (directly from logs)
+  - model routing statements (from resolved_config + optimization fields)
+- Medium confidence:
+  - full end-to-end dollar efficiency conclusions while helper-lm cost is excluded from script summaries
+- Out of scope in this report:
+  - quality/accuracy regression analysis (no external labels/eval set applied in this pass)
+

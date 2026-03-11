@@ -1,0 +1,176 @@
+LOTUS Simulation Optimization Analysis (Server Run)
+Date: 2026-03-11
+Author: Codex (log-based analysis only)
+
+Scope
+- This report analyzes the latest three server-generated logs copied into this folder:
+  - zep_execution_log_20260310_152222.json
+  - mem0_execution_log_20260310_153659.json
+  - lotus_execution_log_20260310_155027.json (EverMemOS pipeline)
+- It also compares against prior local baselines where relevant:
+  - zep_execution_log_20260310_094924.json (flags on, proxy=embedding)
+  - mem0_execution_log_20260310_093911.json (flags on, proxy=embedding)
+  - lotus_execution_log_20260310_093542.json (flags on, proxy=embedding)
+  - mem0_execution_log_20260309_214359.json / zep_execution_log_20260308_215223.json / lotus_execution_log_20260310_153342.json (flags off baselines)
+
+Method
+- Read each JSON's config.resolved_config, config.optimizations, operations[], and summary.
+- Counted cascade activation per operator (cascade_enabled true/false), cascade_stats presence, fallback errors, and cache counters.
+- Compared wall-clock runtime from start_time/end_time and cost fields from summary.
+
+Important Accounting Caveat
+- The script summaries read usage from lm.stats (main LM only), not helper_lm stats.
+- Therefore, physical/virtual cost in these logs does NOT represent full helper-model spend.
+- If helper_lm is used (e.g., vLLM), true total cost/throughput must also be read from helper-side telemetry (vLLM logs/metrics).
+
+============================================================
+A) High-Level Findings
+============================================================
+1) vLLM usage
+- mem0: YES (helper-lm cascade used in Q8 sem_filter).
+- evermemos: YES (helper-lm cascade used in Q1 sem_filter).
+- zep: NOT as helper-lm for sem_join (by LOTUS design/path), although join cascade itself is active.
+
+2) LOTUS optimization usage
+- mem0: filter cascade active; operator cache active; LM exact cache still 0.
+- evermemos: filter cascade active; no cache benefit observed.
+- zep: join cascade active for Q2 and Q6; heavy LM cache usage; operator cache improved; Q5 join path still partially failing.
+
+3) Why zep does not use helper-lm in join (even with proxy_model=helper_lm)
+- In LOTUS sem_join optimizer, helper-lm is explicitly not supported in the active join proxy path and defaults to similarity proxy.
+- This is consistent with observed behavior: join cascade stats exist, but there is no evidence of helper-lm-specific join proxy execution.
+
+============================================================
+B) Pipeline-by-Pipeline Detail
+============================================================
+
+B1) ZEP (latest: zep_execution_log_20260310_152222.json)
+Config evidence
+- main model: deepseek/deepseek-chat
+- helper configured and enabled
+- proxy requested/effective: helper_lm -> helper_lm
+- join cascade enabled: true
+- min_join_cascade_size: 1
+
+Observed optimization behavior
+- Q2_sem_join: 39/39 calls cascade_enabled=true.
+- Q6_sem_join: 23/23 calls cascade_enabled=true.
+- Q5_sem_join: 39 calls cascade_enabled=false; 24 had cascade_fallback_error.
+- cache_hits=1686, operator_cache_hits=110.
+
+Join cascade effectiveness (from aggregated cascade_stats)
+- Q2_sem_join:
+  - join_resolved_by_helper_model = 979
+  - join_resolved_by_large_model = 3
+  - helper-resolution share ~99.7% over evaluated candidate pairs.
+- Q6_sem_join:
+  - join_resolved_by_helper_model = 72
+  - join_resolved_by_large_model = 204
+  - helper-resolution share ~26.1%.
+- Q5_sem_join fallback rate: 24/39 (~61.5%).
+
+Cost/time outcome vs prior-on baseline (20260310_094924)
+- Physical cost: 0.0119687 -> 0.0154076 (+28.7%).
+- Runtime: 483.4s -> 746.7s (+54.5%).
+- LM cache hits decreased: 1877 -> 1686.
+- Operator cache hits increased: 6 -> 110.
+
+Interpretation
+- The previous unpacking failure is fixed; join cascade is now genuinely active on Q2/Q6.
+- Runtime/cost increased because cascade optimization itself incurs planning/calibration work, and Q5 still has substantial fallback failures.
+- The large LM cache savings are still present, but not enough to offset added optimization overhead + Q5 instability in this run.
+
+B2) MEM0 (latest: mem0_execution_log_20260310_153659.json)
+Config evidence
+- main model: deepseek/deepseek-chat
+- helper enabled
+- proxy requested/effective: helper_lm -> helper_lm
+- filter/join/topk flags all true; min_join_cascade_size=1
+
+Observed optimization behavior
+- Q8_sem_filter: 39/39 calls cascade_enabled=true.
+- Q8 cascade_stats across all calls show:
+  - filters_resolved_by_helper_model=1 per call
+  - filters_resolved_by_large_model=0 per call
+- cache_hits=0, operator_cache_hits=62.
+
+Cost/time outcome
+- vs prior-on baseline (20260310_093911):
+  - Physical cost: 0.0082463 -> 0.0061557 (-25.4%).
+  - Runtime: 563.3s -> 524.9s (-6.8%).
+- vs flags-off baseline (20260309_214359):
+  - Physical cost: 0.0071021 -> 0.0061557 (-13.3%).
+  - Runtime: 683.4s -> 524.9s (-23.2%).
+
+Interpretation
+- mem0 is the clearest success case for current helper-lm cascade path.
+- The sem_filter cascade in Q8 consistently routes to helper decisions in this dataset.
+- No LM exact cache usage, so gains are from cascade behavior and changed execution pattern, not cache.
+
+B3) EVERMEMOS (latest: lotus_execution_log_20260310_155027.json)
+Config evidence
+- main model: deepseek/deepseek-chat
+- helper enabled
+- proxy requested/effective: helper_lm -> helper_lm
+- optimization flags true; min_join_cascade_size=1
+
+Observed optimization behavior
+- Q1_sem_filter: 13/13 calls cascade_enabled=true.
+- Q1 cascade_stats show helper-only resolutions per call:
+  - filters_resolved_by_helper_model=1
+  - filters_resolved_by_large_model=0
+- cache_hits=0, operator_cache_hits=0.
+
+Cost/time outcome vs flags-off baseline (20260310_153342)
+- Physical cost: 0.0023724 -> 0.0028164 (+18.7%).
+- Runtime: 86.2s -> 112.3s (+30.2%).
+- total_segments: 7 -> 13.
+
+Interpretation
+- Cascade is active and helper is being used for boundary filtering.
+- However, this run produced many more segment boundaries, increasing downstream extraction workload.
+- With no cache effect, total main-LM cost/runtime rose despite helper-resolved boundary checks.
+
+============================================================
+C) Why zep still appears to "not use vLLM"
+============================================================
+1) Main model remained deepseek in the resolved config.
+2) zep workload is dominated by sem_join, not sem_filter.
+3) LOTUS join optimizer path is primarily similarity-proxy based and does not currently execute helper-lm as the join proxy path.
+4) Therefore, even with proxy_model=helper_lm in config, zep join behavior is constrained by LOTUS sem_join implementation, not only YAML settings.
+
+============================================================
+D) Which optimizations were used / not used
+============================================================
+Used
+- LM cache: strongly used in zep, not used in mem0/evermemos.
+- Operator cache: used in mem0 and zep; absent in evermemos latest.
+- Filter cascade (helper-lm): used in mem0 Q8 and evermemos Q1.
+- Join cascade: used in zep Q2/Q6 (with partial fallback in Q5).
+
+Not used or effectively inactive
+- sem_topk cascade: no sem_topk operator in these insertion scripts; flag being true does not create runtime usage.
+- helper-lm as join proxy in zep: not active in current LOTUS sem_join path.
+
+============================================================
+E) Root Cause Attribution
+============================================================
+Workflow-driven
+- mem0 and evermemos each have a sem_filter stage where helper cascade can be directly applied.
+- zep insertion relies heavily on sem_join stages; behavior depends on LOTUS sem_join optimizer internals.
+
+LOTUS-implementation-driven
+- sem_join helper-lm proxy path is not the active default join helper mechanism; similarity proxy dominates.
+- This limits direct vLLM-helper impact in zep join-heavy flows.
+
+Script/data-driven
+- zep Q5 shows recurring index-out-of-bounds fallback errors, reducing effective optimization and adding overhead.
+- evermemos segmentation increased to 13 segments in the latest run, increasing downstream work.
+
+============================================================
+F) Confidence and Limits
+============================================================
+- High confidence: activation/fallback/cache counts and config routing conclusions (directly log-derived).
+- Medium confidence: exact total-dollar improvement when helper-lm is enabled, because helper-lm cost is not included in lm.stats summary.
+- Not inferred beyond logs: no claims about model quality/accuracy changes since no external evaluation labels were provided here.
+
