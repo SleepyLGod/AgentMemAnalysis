@@ -359,3 +359,33 @@ where (select segment_count from Topic
        where topic_id = RecentMemoryTopicAssignment.topic_id) >= :min_segments;
 -- profiles are MongoDB-only (no ES/Milvus sync)
 ```
+
+### Optional Formulation for Step 2.1 (`sem_group_by`)
+
+```sql
+-- Alternative expression of step 2.1:
+-- use semantic grouping semantics instead of "sim_join + coalesce(new_topic_id)"
+RecentMemoryTopicAssignment as (
+    select
+        sem_group_by(
+            RecentMemories.episode,
+            Topic.centroid,
+            "Assign this episode to the most suitable thematic storyline; "
+            "if no existing topic matches, create a new topic"
+        ) as topic_id,
+        RecentMemories.episode as episode,
+        :now as assigned_at
+    from RecentMemories
+    where time_gap(Topic.last_timestamp, :now) < :max_gap_days
+       or is_new_semantic_group(topic_id) = true
+);
+
+-- Then keep the same state update semantics:
+-- upsert Topic(topic_id, centroid, last_timestamp, segment_count)
+-- from RecentMemoryTopicAssignment
+```
+
+Notes:
+- This does not change business semantics. It is a cleaner *conceptual* formulation of "topic assignment + possible new-topic creation".
+- `sem_group_by` emphasizes that Topic is a continuously maintained semantic grouping state, not just one-shot nearest-neighbor retrieval.
+- In the current LOTUS simulation, this still maps to practical primitives (`sem_sim_join` + relational state upsert), because native streaming `sem_group_by` lifecycle APIs are not directly exposed in the same way.
